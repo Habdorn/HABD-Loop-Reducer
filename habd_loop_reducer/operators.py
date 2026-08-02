@@ -1,14 +1,31 @@
 """Operators provided by HABD Loop Reducer."""
 
+import math
+
 import bpy
 import bmesh
 
 from .utils import (
+    analyze_curved_tube,
     analyze_selected_chains,
     build_reduction_plan,
+    collect_curved_reduction_data,
     is_valid_edit_mesh_context,
+    reduce_curved_tube,
     redistribute_surviving_chains,
 )
+
+
+def _store_curved_analysis(settings, analysis) -> None:
+    """Copy simple analysis values into RNA properties for display."""
+    settings.curve_analysis_valid = analysis.valid
+    settings.curve_level_count = len(analysis.levels)
+    settings.curve_path_length = analysis.path_length
+    settings.curve_min_radius = analysis.min_radius
+    settings.curve_max_radius = analysis.max_radius
+    settings.curve_max_turn_angle = analysis.max_turn_angle
+    settings.curve_frame_continuity = analysis.frame_continuity
+    settings.curve_status = analysis.status
 
 
 class HABD_OT_detect_segments(bpy.types.Operator):
@@ -52,6 +69,53 @@ class HABD_OT_detect_segments(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class HABD_OT_analyze_curved_tube(bpy.types.Operator):
+    """Analyze selected longitudinal chains without modifying the mesh."""
+
+    bl_idname = "mesh.habd_analyze_curved_tube"
+    bl_label = "Analyze Curved Tube"
+    bl_description = "Analyze a curved tubular selection without changing geometry"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return is_valid_edit_mesh_context(context)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        if not is_valid_edit_mesh_context(context):
+            self.report({"ERROR"}, "An active mesh must be in Edit Mode")
+            return {"CANCELLED"}
+
+        settings = context.scene.habd_loop_reducer
+        mesh = context.active_object.data
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        selected_edges = tuple(edge for edge in edit_mesh.edges if edge.select)
+        analysis = analyze_curved_tube(selected_edges)
+        _store_curved_analysis(settings, analysis)
+        settings.current_segments = len(analysis.ordered_chains)
+        settings.segments_to_remove = (
+            settings.current_segments - settings.target_segments
+        )
+        settings.selection_compatible = analysis.valid
+
+        if not selected_edges:
+            self.report({"WARNING"}, analysis.status)
+            return {"CANCELLED"}
+
+        if analysis.valid:
+            summary = (
+                f"Curved tube valid | Levels: {len(analysis.levels)} | "
+                f"Path: {analysis.path_length:.2f} | "
+                f"Max turn: {math.degrees(analysis.max_turn_angle):.1f}°"
+            )
+            self.report({"INFO"}, summary)
+            print(summary)
+        else:
+            self.report({"WARNING"}, analysis.status)
+            print(analysis.status)
+        return {"FINISHED"}
+
+
 class HABD_OT_reduce_loops(bpy.types.Operator):
     """Reduce selected longitudinal chains and redistribute the survivors."""
 
@@ -69,6 +133,8 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
         if not is_valid_edit_mesh_context(context):
             self.report({"ERROR"}, "An active mesh must be in Edit Mode")
             return {"CANCELLED"}
+        if settings.geometry_mode == "CURVED":
+            return self._execute_curved(context, settings)
 
         active_object = context.active_object
         if active_object.data.shape_keys is not None:
@@ -138,8 +204,55 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
 
         return {"FINISHED"}
 
+    def _execute_curved(self, context, settings) -> set[str]:
+        """Reanalyze and reduce one compatible curved tubular selection."""
+        active_object = context.active_object
+        if active_object.data.shape_keys is not None:
+            self.report({"ERROR"}, "Reduction is disabled for meshes with shape keys")
+            return {"CANCELLED"}
+
+        mesh = active_object.data
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        selected_edges = tuple(edge for edge in edit_mesh.edges if edge.select)
+        analysis = analyze_curved_tube(selected_edges)
+        _store_curved_analysis(settings, analysis)
+        settings.current_segments = len(analysis.ordered_chains)
+        settings.segments_to_remove = (
+            settings.current_segments - settings.target_segments
+        )
+        settings.selection_compatible = analysis.valid
+        if not analysis.valid:
+            self.report({"ERROR"}, analysis.status)
+            return {"CANCELLED"}
+
+        edit_mesh.normal_update()
+        try:
+            plan = collect_curved_reduction_data(
+                analysis,
+                settings.target_segments,
+            )
+        except ValueError as error:
+            settings.curve_analysis_valid = False
+            settings.selection_compatible = False
+            settings.curve_status = str(error)
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+        result = reduce_curved_tube(edit_mesh, plan)
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+
+        settings.current_segments = settings.target_segments
+        settings.segments_to_remove = 0
+        settings.selection_compatible = False
+        settings.curve_analysis_valid = False
+        settings.curve_status = "Curved reduction completed; analyze again"
+        self.report({"INFO"}, result.message)
+        print(result.message)
+        return {"FINISHED"}
+
 
 classes = (
     HABD_OT_detect_segments,
+    HABD_OT_analyze_curved_tube,
     HABD_OT_reduce_loops,
 )
