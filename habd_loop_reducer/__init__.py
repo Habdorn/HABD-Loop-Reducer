@@ -18,7 +18,7 @@ from .panel import classes as panel_classes
 bl_info = {
     "name": "HABD Loop Reducer",
     "author": "Habdorn",
-    "version": (0, 1, 0),
+    "version": (0, 2, 0),
     "blender": (5, 2, 0),
     "location": "View3D > Sidebar > HABD",
     "description": "Reducción controlada de loops y segmentos en mallas",
