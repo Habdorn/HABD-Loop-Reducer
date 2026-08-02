@@ -3,6 +3,7 @@
 import math
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
+from enum import Enum
 from typing import Any
 
 import bmesh
@@ -12,7 +13,8 @@ from mathutils import Quaternion, Vector
 _GEOMETRY_EPSILON = 1.0e-8
 _CURVE_CIRCULARITY_TOLERANCE = 0.05
 _FRAME_FLIP_DOT_THRESHOLD = -0.95
-_CURVE_AXIAL_OFFSET_LIMIT_RATIO = 0.05
+_CURVE_PLANARITY_TOLERANCE = 0.05
+_CURVE_MEAN_PLANARITY_TOLERANCE = 0.025
 _CURVE_RESULT_TOLERANCE_RATIO = 1.0e-5
 
 
@@ -42,12 +44,33 @@ class CurvedLevelInfo:
     """Geometric measurements and transported frame for one tube level."""
 
     center: Vector
+    path_tangent: Vector
     tangent: Vector
     normal: Vector
     binormal: Vector
     average_radius: float
     min_radius: float
     max_radius: float
+    max_abs_axial_offset: float
+    mean_abs_axial_offset: float
+    planarity_ratio: float
+
+
+class TubeEndType(str, Enum):
+    """Supported longitudinal endpoint configurations."""
+
+    OPEN = "OPEN"
+    NGON_CAP = "NGON_CAP"
+    UNSUPPORTED = "UNSUPPORTED"
+
+
+@dataclass(frozen=True)
+class TubeEndInfo:
+    """Classification and preserved data for one longitudinal endpoint."""
+
+    end_type: TubeEndType
+    cap_face: Any | None
+    status: str
 
 
 @dataclass(frozen=True)
@@ -85,7 +108,7 @@ class CurvedReductionPlan:
     reference_angles: tuple[float, ...]
     axial_offsets: tuple[tuple[float, ...], ...]
     edges_to_dissolve: tuple[Any, ...]
-    cap_presence: tuple[bool, bool]
+    end_types: tuple[TubeEndType, TubeEndType]
     cap_normals: tuple[Vector | None, Vector | None]
     cap_material_indices: tuple[int | None, int | None]
     lateral_winding_sign: int
@@ -511,6 +534,52 @@ def calculate_local_tangents(centers: Sequence[Vector]) -> tuple[Vector, ...]:
     return tuple(tangents)
 
 
+def calculate_ring_normals(
+    levels: Sequence[Sequence[Any]],
+    path_tangents: Sequence[Vector],
+) -> tuple[Vector, ...]:
+    """Calculate consistently oriented geometric ring normals using Newell."""
+    if len(levels) != len(path_tangents):
+        raise ValueError("Ring levels and centerline tangents do not match")
+    ring_normals = []
+    previous_normal = None
+    for level_index, (level, path_tangent) in enumerate(
+        zip(levels, path_tangents)
+    ):
+        ring_normal = Vector((0.0, 0.0, 0.0))
+        for current, following in zip(level, level[1:] + level[:1]):
+            ring_normal.x += (
+                (current.co.y - following.co.y)
+                * (current.co.z + following.co.z)
+            )
+            ring_normal.y += (
+                (current.co.z - following.co.z)
+                * (current.co.x + following.co.x)
+            )
+            ring_normal.z += (
+                (current.co.x - following.co.x)
+                * (current.co.y + following.co.y)
+            )
+        if ring_normal.length <= _GEOMETRY_EPSILON:
+            raise ValueError(
+                f"Level {level_index + 1} has a degenerate ring normal"
+            )
+        ring_normal.normalize()
+        alignment = ring_normal.dot(path_tangent)
+        if abs(alignment) <= 1.0e-4:
+            raise ValueError(
+                f"Level {level_index + 1} ring normal is incompatible "
+                "with the centerline"
+            )
+        if alignment < 0.0:
+            ring_normal.negate()
+        if previous_normal is not None and ring_normal.dot(previous_normal) < 0.0:
+            ring_normal.negate()
+        ring_normals.append(ring_normal)
+        previous_normal = ring_normal
+    return tuple(ring_normals)
+
+
 def build_initial_frame(
     level: Sequence[Any],
     center: Vector,
@@ -568,6 +637,24 @@ def parallel_transport_frame(
     binormal.normalize()
     normal = binormal.cross(current_tangent).normalized()
     return current_tangent.copy(), normal, binormal
+
+
+def reproject_frame_to_ring_plane(
+    previous_frame: tuple[Vector, Vector, Vector],
+    ring_normal: Vector,
+) -> tuple[Vector, Vector, Vector]:
+    """Keep the previous radial reference projected into a real ring plane."""
+    _, previous_normal, _ = previous_frame
+    projected = previous_normal - ring_normal * previous_normal.dot(ring_normal)
+    if projected.length <= _GEOMETRY_EPSILON:
+        return parallel_transport_frame(previous_frame, ring_normal)
+    normal = projected.normalized()
+    binormal = ring_normal.cross(normal)
+    if binormal.length <= _GEOMETRY_EPSILON:
+        return parallel_transport_frame(previous_frame, ring_normal)
+    binormal.normalize()
+    normal = binormal.cross(ring_normal).normalized()
+    return ring_normal.copy(), normal, binormal
 
 
 def calculate_level_radius_data(
@@ -661,17 +748,23 @@ def analyze_curved_tube(selected_edges: Iterable[Any]) -> CurvedTubeAnalysis:
                 levels=levels,
             )
         path_length = sum(segment_lengths)
-        tangents = calculate_local_tangents(centers)
-        frame = build_initial_frame(levels[0], centers[0], tangents[0])
+        path_tangents = calculate_local_tangents(centers)
+        ring_normals = calculate_ring_normals(levels, path_tangents)
+        frame = build_initial_frame(levels[0], centers[0], ring_normals[0])
         frames = [frame]
         frame_continuity = True
         max_turn_angle = 0.0
-        for index in range(1, len(tangents)):
+        for index in range(1, len(ring_normals)):
             turn_angle = math.acos(
-                max(-1.0, min(1.0, tangents[index - 1].dot(tangents[index])))
+                max(
+                    -1.0,
+                    min(1.0, ring_normals[index - 1].dot(ring_normals[index])),
+                )
             )
             max_turn_angle = max(max_turn_angle, turn_angle)
-            current_frame = parallel_transport_frame(frames[-1], tangents[index])
+            current_frame = reproject_frame_to_ring_plane(
+                frames[-1], ring_normals[index]
+            )
             if (
                 frames[-1][1].dot(current_frame[1])
                 <= _FRAME_FLIP_DOT_THRESHOLD
@@ -684,8 +777,11 @@ def analyze_curved_tube(selected_edges: Iterable[Any]) -> CurvedTubeAnalysis:
         level_info_items = []
         global_min_radius = math.inf
         global_max_radius = 0.0
-        circularity_valid = True
-        for level, center, frame in zip(levels, centers, frames):
+        circularity_failure = None
+        planarity_failure = None
+        for level_index, (level, center, path_tangent, frame) in enumerate(
+            zip(levels, centers, path_tangents, frames)
+        ):
             tangent, normal, binormal = frame
             average, minimum, maximum, radii = calculate_level_radius_data(
                 level, center, tangent
@@ -700,20 +796,41 @@ def analyze_curved_tube(selected_edges: Iterable[Any]) -> CurvedTubeAnalysis:
                     max_turn_angle=max_turn_angle,
                     frame_continuity=frame_continuity,
                 )
-            circularity_valid = circularity_valid and validate_level_circularity(
-                radii, average
+            if (
+                circularity_failure is None
+                and not validate_level_circularity(radii, average)
+            ):
+                circularity_failure = level_index + 1
+            axial_offsets = tuple(
+                abs((vertex.co - center).dot(tangent)) for vertex in level
             )
+            max_abs_offset = max(axial_offsets)
+            mean_abs_offset = sum(axial_offsets) / len(axial_offsets)
+            planarity_ratio = max_abs_offset / average
+            mean_planarity_ratio = mean_abs_offset / average
+            if (
+                planarity_failure is None
+                and (
+                    planarity_ratio > _CURVE_PLANARITY_TOLERANCE
+                    or mean_planarity_ratio > _CURVE_MEAN_PLANARITY_TOLERANCE
+                )
+            ):
+                planarity_failure = level_index + 1
             global_min_radius = min(global_min_radius, minimum)
             global_max_radius = max(global_max_radius, maximum)
             level_info_items.append(
                 CurvedLevelInfo(
                     center=center.copy(),
+                    path_tangent=path_tangent.copy(),
                     tangent=tangent.copy(),
                     normal=normal.copy(),
                     binormal=binormal.copy(),
                     average_radius=average,
                     min_radius=minimum,
                     max_radius=maximum,
+                    max_abs_axial_offset=max_abs_offset,
+                    mean_abs_axial_offset=mean_abs_offset,
+                    planarity_ratio=planarity_ratio,
                 )
             )
         level_info = tuple(level_info_items)
@@ -727,8 +844,18 @@ def analyze_curved_tube(selected_edges: Iterable[Any]) -> CurvedTubeAnalysis:
             "max_turn_angle": max_turn_angle,
             "frame_continuity": frame_continuity,
         }
-        if not circularity_valid:
-            return result(False, "Cross section is not circular enough", **common_values)
+        if circularity_failure is not None:
+            return result(
+                False,
+                f"Level {circularity_failure} is not circular enough",
+                **common_values,
+            )
+        if planarity_failure is not None:
+            return result(
+                False,
+                f"Level {planarity_failure} is not planar enough",
+                **common_values,
+            )
         if not frame_continuity:
             return result(False, "Frame continuity failed", **common_values)
         return result(True, "Curved tube analysis is compatible", **common_values)
@@ -864,47 +991,81 @@ def calculate_reference_angles_per_level(
     return unwrap_angle_sequence(angles)
 
 
-def _endpoint_cap_faces(
-    levels: Sequence[Sequence[Any]],
-) -> tuple[Any | None, Any | None]:
-    """Return compatible end-cap ngons and reject partial cap topology."""
-    cap_faces = []
-    endpoint_data = ((0, 1), (-1, -2))
-    for endpoint_index, adjacent_index in endpoint_data:
-        level = levels[endpoint_index]
-        adjacent_level = set(levels[adjacent_index])
-        common_faces = set(level[0].link_faces)
-        for vertex in level[1:]:
-            common_faces.intersection_update(vertex.link_faces)
-        complete_caps = [
-            face
-            for face in common_faces
-            if set(level).issubset(set(face.verts))
-            and not adjacent_level.intersection(face.verts)
-        ]
-
-        endpoint_faces = set()
-        for index, vertex in enumerate(level):
-            next_vertex = level[(index + 1) % len(level)]
-            edge = _find_connecting_edge(vertex, next_vertex)
-            if edge is None:
-                raise ValueError("An endpoint perimeter is incomplete")
-            endpoint_faces.update(
-                face
-                for face in edge.link_faces
-                if not adjacent_level.intersection(face.verts)
+def classify_tube_end(
+    level: Sequence[Any],
+    adjacent_level: Sequence[Any],
+    label: str,
+) -> TubeEndInfo:
+    """Classify one endpoint as open, one compatible ngon, or unsupported."""
+    adjacent_vertices = set(adjacent_level)
+    endpoint_faces = set()
+    perimeter_edges = []
+    for index, vertex in enumerate(level):
+        next_vertex = level[(index + 1) % len(level)]
+        edge = _find_connecting_edge(vertex, next_vertex)
+        if edge is None:
+            return TubeEndInfo(
+                TubeEndType.UNSUPPORTED,
+                None,
+                f"End {label} uses unsupported cap topology",
             )
+        perimeter_edges.append(edge)
+        lateral_faces = tuple(
+            face for face in edge.link_faces if adjacent_vertices.intersection(face.verts)
+        )
+        if len(lateral_faces) != 1:
+            return TubeEndInfo(
+                TubeEndType.UNSUPPORTED,
+                None,
+                f"End {label} uses unsupported cap topology",
+            )
+        endpoint_faces.update(
+            face
+            for face in edge.link_faces
+            if not adjacent_vertices.intersection(face.verts)
+        )
 
-        if not endpoint_faces:
-            cap_faces.append(None)
-            continue
-        if len(complete_caps) != 1 or endpoint_faces != {complete_caps[0]}:
-            raise ValueError("Only open ends or compatible ngon caps are supported")
-        cap = complete_caps[0]
-        if len(cap.verts) != len(level):
-            raise ValueError("An end cap contains unexpected vertices")
-        cap_faces.append(cap)
-    return cap_faces[0], cap_faces[1]
+    if not endpoint_faces:
+        if all(len(edge.link_faces) == 1 for edge in perimeter_edges):
+            return TubeEndInfo(TubeEndType.OPEN, None, f"End {label} is open")
+        return TubeEndInfo(
+            TubeEndType.UNSUPPORTED,
+            None,
+            f"End {label} uses unsupported cap topology",
+        )
+    if len(endpoint_faces) != 1:
+        return TubeEndInfo(
+            TubeEndType.UNSUPPORTED,
+            None,
+            f"End {label} uses unsupported cap topology",
+        )
+
+    cap = next(iter(endpoint_faces))
+    if (
+        set(cap.verts) != set(level)
+        or len(cap.verts) != len(level)
+        or any(len(edge.link_faces) != 2 or cap not in edge.link_faces for edge in perimeter_edges)
+    ):
+        return TubeEndInfo(
+            TubeEndType.UNSUPPORTED,
+            None,
+            f"End {label} uses unsupported cap topology",
+        )
+    return TubeEndInfo(
+        TubeEndType.NGON_CAP,
+        cap,
+        f"End {label} has a compatible ngon cap",
+    )
+
+
+def classify_tube_ends(
+    levels: Sequence[Sequence[Any]],
+) -> tuple[TubeEndInfo, TubeEndInfo]:
+    """Classify both longitudinal endpoints independently."""
+    return (
+        classify_tube_end(levels[0], levels[1], "A"),
+        classify_tube_end(levels[-1], levels[-2], "B"),
+    )
 
 
 def _calculate_lateral_winding_sign(
@@ -1004,12 +1165,20 @@ def collect_curved_reduction_data(
         )
         average_offset = sum(raw_offsets) / len(raw_offsets)
         centered_offsets = tuple(value - average_offset for value in raw_offsets)
-        offset_limit = max(
-            _GEOMETRY_EPSILON * 10.0,
-            info.average_radius * _CURVE_AXIAL_OFFSET_LIMIT_RATIO,
+        max_abs_offset = max(abs(value) for value in centered_offsets)
+        mean_abs_offset = sum(abs(value) for value in centered_offsets) / len(
+            centered_offsets
         )
-        if any(abs(value) > offset_limit for value in centered_offsets):
-            raise ValueError("A level contains anomalous axial offsets")
+        maximum_limit = max(
+            _GEOMETRY_EPSILON * 10.0,
+            info.average_radius * _CURVE_PLANARITY_TOLERANCE,
+        )
+        mean_limit = max(
+            _GEOMETRY_EPSILON * 10.0,
+            info.average_radius * _CURVE_MEAN_PLANARITY_TOLERANCE,
+        )
+        if max_abs_offset > maximum_limit or mean_abs_offset > mean_limit:
+            raise ValueError(f"Level {level_index + 1} is not planar enough")
         axial_offsets.append(centered_offsets)
 
     edges_to_dissolve = tuple(
@@ -1026,7 +1195,10 @@ def collect_curved_reduction_data(
     ):
         raise ValueError("Could not resolve every curved chain marked for removal")
 
-    cap_faces = _endpoint_cap_faces(levels)
+    end_infos = classify_tube_ends(levels)
+    for end_info in end_infos:
+        if end_info.end_type is TubeEndType.UNSUPPORTED:
+            raise ValueError(end_info.status)
     lateral_winding_sign = _calculate_lateral_winding_sign(
         ordered_chains, centers
     )
@@ -1046,12 +1218,18 @@ def collect_curved_reduction_data(
         reference_angles=reference_angles,
         axial_offsets=tuple(axial_offsets),
         edges_to_dissolve=edges_to_dissolve,
-        cap_presence=tuple(face is not None for face in cap_faces),
+        end_types=tuple(end_info.end_type for end_info in end_infos),
         cap_normals=tuple(
-            face.normal.copy() if face is not None else None for face in cap_faces
+            end_info.cap_face.normal.copy()
+            if end_info.cap_face is not None
+            else None
+            for end_info in end_infos
         ),
         cap_material_indices=tuple(
-            face.material_index if face is not None else None for face in cap_faces
+            end_info.cap_face.material_index
+            if end_info.cap_face is not None
+            else None
+            for end_info in end_infos
         ),
         lateral_winding_sign=lateral_winding_sign,
     )
@@ -1155,14 +1333,36 @@ def validate_curved_result(
     ) != plan.lateral_winding_sign:
         raise RuntimeError("Curved reduction inverted lateral face winding")
 
-    cap_faces = _endpoint_cap_faces(survivor_levels)
-    for index, cap in enumerate(cap_faces):
-        if (cap is not None) != plan.cap_presence[index]:
+    end_infos = classify_tube_ends(survivor_levels)
+    for index, end_info in enumerate(end_infos):
+        if end_info.end_type is TubeEndType.UNSUPPORTED:
+            raise RuntimeError(end_info.status)
+        if end_info.end_type is not plan.end_types[index]:
             raise RuntimeError("Curved reduction changed endpoint closure")
-        if cap is None:
+        endpoint_level = survivor_levels[0 if index == 0 else -1]
+        perimeter_edges = tuple(
+            _find_connecting_edge(
+                endpoint_level[vertex_index],
+                endpoint_level[(vertex_index + 1) % plan.target_segments],
+            )
+            for vertex_index in range(plan.target_segments)
+        )
+        if any(edge is None for edge in perimeter_edges):
+            raise RuntimeError("Curved reduction produced an invalid endpoint")
+        if end_info.end_type is TubeEndType.OPEN:
+            if (
+                sum(len(edge.link_faces) == 1 for edge in perimeter_edges)
+                != plan.target_segments
+            ):
+                raise RuntimeError("Curved reduction changed an open endpoint")
             continue
+        cap = end_info.cap_face
+        if cap is None:
+            raise RuntimeError("Curved reduction lost an end cap")
         if len(cap.verts) != plan.target_segments:
             raise RuntimeError("Curved reduction produced an invalid end cap")
+        if any(len(edge.link_faces) != 2 for edge in perimeter_edges):
+            raise RuntimeError("Curved reduction opened a capped endpoint")
         if cap.normal.dot(plan.cap_normals[index]) <= 0.0:
             raise RuntimeError("Curved reduction inverted an end cap")
         if cap.material_index != plan.cap_material_indices[index]:
