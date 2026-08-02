@@ -19,25 +19,56 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
         settings = context.scene.habd_loop_reducer
 
         layout.label(text="HABD Loop Reducer")
+        layout.prop(settings, "geometry_mode", text="Geometry Mode")
 
-        detect_row = layout.row()
-        detect_row.enabled = is_valid_edit_mesh_context(context)
-        detect_row.operator("mesh.habd_detect_segments", text="Detect Segments")
+        if settings.geometry_mode == "CURVED":
+            analyze_row = layout.row()
+            analyze_row.enabled = is_valid_edit_mesh_context(context)
+            analyze_row.operator(
+                "mesh.habd_analyze_curved_tube",
+                text="Analyze Curved Tube",
+            )
 
-        results = layout.column(align=True)
-        results.label(text=f"Current Segments: {settings.current_segments}")
-        results.prop(settings, "target_segments", text="Target Segments")
-        results.label(text=f"Segments to Remove: {settings.segments_to_remove}")
-        compatible_text = "Yes" if settings.selection_compatible else "No"
-        results.label(text=f"Compatible: {compatible_text}")
-        results.label(text=f"Status: {settings.selection_status}")
+            analysis_box = layout.box()
+            analysis_box.label(text="Curved Analysis")
+            analysis_box.label(text=f"Status: {settings.curve_status}")
+            analysis_box.label(text=f"Levels: {settings.curve_level_count}")
+            analysis_box.prop(settings, "curve_path_length", text="Path Length")
+            analysis_box.prop(settings, "curve_min_radius", text="Minimum Radius")
+            analysis_box.prop(settings, "curve_max_radius", text="Maximum Radius")
+            analysis_box.prop(
+                settings,
+                "curve_max_turn_angle",
+                text="Maximum Turn Angle",
+            )
+            continuity = "Yes" if settings.curve_frame_continuity else "No"
+            analysis_box.label(text=f"Frame Continuity: {continuity}")
 
-        operator_row = layout.row()
-        operator_row.enabled = (
-            is_valid_edit_mesh_context(context)
-            and settings.selection_compatible
-        )
-        operator_row.operator("mesh.habd_reduce_loops", text="Reduce Loops")
+            warning = layout.column()
+            warning.alert = True
+            warning.label(text="Curved reduction is not implemented yet")
+            operator_row = layout.row()
+            operator_row.enabled = False
+            operator_row.operator("mesh.habd_reduce_loops", text="Reduce Loops")
+        else:
+            detect_row = layout.row()
+            detect_row.enabled = is_valid_edit_mesh_context(context)
+            detect_row.operator("mesh.habd_detect_segments", text="Detect Segments")
+
+            results = layout.column(align=True)
+            results.label(text=f"Current Segments: {settings.current_segments}")
+            results.prop(settings, "target_segments", text="Target Segments")
+            results.label(text=f"Segments to Remove: {settings.segments_to_remove}")
+            compatible_text = "Yes" if settings.selection_compatible else "No"
+            results.label(text=f"Compatible: {compatible_text}")
+            results.label(text=f"Status: {settings.selection_status}")
+
+            operator_row = layout.row()
+            operator_row.enabled = (
+                is_valid_edit_mesh_context(context)
+                and settings.selection_compatible
+            )
+            operator_row.operator("mesh.habd_reduce_loops", text="Reduce Loops")
 
 
 classes = (HABD_PT_loop_reducer,)
