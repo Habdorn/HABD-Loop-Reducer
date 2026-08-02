@@ -33,6 +33,8 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
             analysis_box.label(text="Curved Analysis")
             analysis_box.label(text=f"Status: {settings.curve_status}")
             analysis_box.label(text=f"Levels: {settings.curve_level_count}")
+            analysis_box.label(text=f"Current Segments: {settings.current_segments}")
+            analysis_box.prop(settings, "target_segments", text="Target Segments")
             analysis_box.prop(settings, "curve_path_length", text="Path Length")
             analysis_box.prop(settings, "curve_min_radius", text="Minimum Radius")
             analysis_box.prop(settings, "curve_max_radius", text="Maximum Radius")
@@ -44,11 +46,22 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
             continuity = "Yes" if settings.curve_frame_continuity else "No"
             analysis_box.label(text=f"Frame Continuity: {continuity}")
 
-            warning = layout.column()
-            warning.alert = True
-            warning.label(text="Curved reduction is not implemented yet")
+            reduction_ready = (
+                settings.curve_analysis_valid
+                and settings.target_segments < settings.current_segments
+            )
+            guidance = layout.column()
+            guidance.alert = not reduction_ready
+            if reduction_ready:
+                guidance.label(text="Curved reduction ready")
+            elif settings.curve_analysis_valid:
+                guidance.label(text="Target must be lower than current segments")
+            else:
+                guidance.label(text="Analyze the curved tube before reducing")
             operator_row = layout.row()
-            operator_row.enabled = False
+            operator_row.enabled = (
+                is_valid_edit_mesh_context(context) and reduction_ready
+            )
             operator_row.operator("mesh.habd_reduce_loops", text="Reduce Loops")
         else:
             detect_row = layout.row()

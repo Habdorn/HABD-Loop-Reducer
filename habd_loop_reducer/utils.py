@@ -5,12 +5,15 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
+import bmesh
 from mathutils import Quaternion, Vector
 
 
 _GEOMETRY_EPSILON = 1.0e-8
 _CURVE_CIRCULARITY_TOLERANCE = 0.05
 _FRAME_FLIP_DOT_THRESHOLD = -0.95
+_CURVE_AXIAL_OFFSET_LIMIT_RATIO = 0.05
+_CURVE_RESULT_TOLERANCE_RATIO = 1.0e-5
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,45 @@ class CurvedTubeAnalysis:
     max_radius: float
     max_turn_angle: float
     frame_continuity: bool
+
+
+@dataclass(frozen=True)
+class CurvedReductionPlan:
+    """Validated geometry and live survivors needed for curved reduction."""
+
+    current_segments: int
+    target_segments: int
+    remove_indices: tuple[int, ...]
+    survivor_indices: tuple[int, ...]
+    ordered_chains: tuple[tuple[Any, ...], ...]
+    survivor_chains: tuple[tuple[Any, ...], ...]
+    levels: tuple[tuple[Any, ...], ...]
+    centers: tuple[Vector, ...]
+    tangents: tuple[Vector, ...]
+    normals: tuple[Vector, ...]
+    binormals: tuple[Vector, ...]
+    radii: tuple[float, ...]
+    reference_angles: tuple[float, ...]
+    axial_offsets: tuple[tuple[float, ...], ...]
+    edges_to_dissolve: tuple[Any, ...]
+    cap_presence: tuple[bool, bool]
+    cap_normals: tuple[Vector | None, Vector | None]
+    cap_material_indices: tuple[int | None, int | None]
+    lateral_winding_sign: int
+
+
+@dataclass(frozen=True)
+class CurvedReductionResult:
+    """Topology counts reported after a successful curved reduction."""
+
+    success: bool
+    message: str
+    vertex_count_before: int
+    vertex_count_after: int
+    edge_count_before: int
+    edge_count_after: int
+    face_count_before: int
+    face_count_after: int
 
 
 @dataclass(frozen=True)
@@ -719,6 +761,456 @@ def _validate_circular_structure(chains: Sequence[tuple[Any, ...]]) -> None:
                 raise ValueError(
                     "Selected chains do not have compatible lateral faces"
                 )
+
+
+def _find_lateral_face(
+    first_start: Any,
+    first_end: Any,
+    second_start: Any,
+    second_end: Any,
+) -> Any | None:
+    """Find a face spanning two adjacent chains and two adjacent levels."""
+    required_vertices = {first_start, first_end, second_start, second_end}
+    common_faces = set(first_start.link_faces)
+    common_faces.intersection_update(first_end.link_faces)
+    for face in common_faces:
+        if required_vertices.issubset(set(face.verts)):
+            return face
+    return None
+
+
+def _validate_orthonormal_frame(
+    tangent: Vector,
+    normal: Vector,
+    binormal: Vector,
+) -> None:
+    """Reject non-unit, non-perpendicular, or left-handed local frames."""
+    tolerance = 1.0e-5
+    if any(
+        abs(vector.length - 1.0) > tolerance
+        for vector in (tangent, normal, binormal)
+    ):
+        raise ValueError("Curved analysis contains a non-unit local frame")
+    if any(
+        abs(value) > tolerance
+        for value in (
+            tangent.dot(normal),
+            tangent.dot(binormal),
+            normal.dot(binormal),
+        )
+    ):
+        raise ValueError("Curved analysis contains a non-orthogonal local frame")
+    if tangent.cross(normal).dot(binormal) < 1.0 - tolerance:
+        raise ValueError("Curved analysis contains an inverted local frame")
+
+
+def order_curved_chains_circularly(
+    analysis: CurvedTubeAnalysis,
+) -> tuple[tuple[Any, ...], ...]:
+    """Order all chains once using the first transported local frame."""
+    if not analysis.valid or not analysis.level_info:
+        raise ValueError("A valid curved analysis is required")
+    first_level = analysis.level_info[0]
+    _validate_orthonormal_frame(
+        first_level.tangent,
+        first_level.normal,
+        first_level.binormal,
+    )
+
+    def chain_angle(chain: Sequence[Any]) -> float:
+        relative = chain[0].co - first_level.center
+        radial = relative - first_level.tangent * relative.dot(first_level.tangent)
+        if radial.length <= _GEOMETRY_EPSILON:
+            raise ValueError("A chain has a degenerate angular reference")
+        return math.atan2(
+            radial.dot(first_level.binormal),
+            radial.dot(first_level.normal),
+        )
+
+    ordered_chains = tuple(sorted(analysis.ordered_chains, key=chain_angle))
+    _validate_circular_structure(ordered_chains)
+    return ordered_chains
+
+
+def unwrap_angle_sequence(angles: Sequence[float]) -> tuple[float, ...]:
+    """Choose the nearest equivalent angle at every consecutive level."""
+    if not angles:
+        return ()
+    unwrapped = [angles[0]]
+    for angle in angles[1:]:
+        previous = unwrapped[-1]
+        while angle - previous > math.pi:
+            angle -= math.tau
+        while angle - previous < -math.pi:
+            angle += math.tau
+        if abs(angle - previous) >= math.pi * 0.95:
+            raise ValueError("Angular reference flips between consecutive levels")
+        unwrapped.append(angle)
+    return tuple(unwrapped)
+
+
+def calculate_reference_angles_per_level(
+    reference_chain: Sequence[Any],
+    level_info: Sequence[CurvedLevelInfo],
+) -> tuple[float, ...]:
+    """Project one survivor through all transported local frames."""
+    angles = []
+    for vertex, info in zip(reference_chain, level_info):
+        relative = vertex.co - info.center
+        radial = relative - info.tangent * relative.dot(info.tangent)
+        if radial.length <= _GEOMETRY_EPSILON:
+            raise ValueError("A level has a degenerate angular reference")
+        angles.append(math.atan2(radial.dot(info.binormal), radial.dot(info.normal)))
+    return unwrap_angle_sequence(angles)
+
+
+def _endpoint_cap_faces(
+    levels: Sequence[Sequence[Any]],
+) -> tuple[Any | None, Any | None]:
+    """Return compatible end-cap ngons and reject partial cap topology."""
+    cap_faces = []
+    endpoint_data = ((0, 1), (-1, -2))
+    for endpoint_index, adjacent_index in endpoint_data:
+        level = levels[endpoint_index]
+        adjacent_level = set(levels[adjacent_index])
+        common_faces = set(level[0].link_faces)
+        for vertex in level[1:]:
+            common_faces.intersection_update(vertex.link_faces)
+        complete_caps = [
+            face
+            for face in common_faces
+            if set(level).issubset(set(face.verts))
+            and not adjacent_level.intersection(face.verts)
+        ]
+
+        endpoint_faces = set()
+        for index, vertex in enumerate(level):
+            next_vertex = level[(index + 1) % len(level)]
+            edge = _find_connecting_edge(vertex, next_vertex)
+            if edge is None:
+                raise ValueError("An endpoint perimeter is incomplete")
+            endpoint_faces.update(
+                face
+                for face in edge.link_faces
+                if not adjacent_level.intersection(face.verts)
+            )
+
+        if not endpoint_faces:
+            cap_faces.append(None)
+            continue
+        if len(complete_caps) != 1 or endpoint_faces != {complete_caps[0]}:
+            raise ValueError("Only open ends or compatible ngon caps are supported")
+        cap = complete_caps[0]
+        if len(cap.verts) != len(level):
+            raise ValueError("An end cap contains unexpected vertices")
+        cap_faces.append(cap)
+    return cap_faces[0], cap_faces[1]
+
+
+def _calculate_lateral_winding_sign(
+    chains: Sequence[Sequence[Any]],
+    centers: Sequence[Vector],
+) -> int:
+    """Require one consistent inward or outward winding on all lateral faces."""
+    winding_sign = 0
+    for chain_index, chain in enumerate(chains):
+        next_chain = chains[(chain_index + 1) % len(chains)]
+        for level_index in range(len(chain) - 1):
+            face = _find_lateral_face(
+                chain[level_index],
+                chain[level_index + 1],
+                next_chain[level_index],
+                next_chain[level_index + 1],
+            )
+            if face is None:
+                raise ValueError("A lateral face band is incomplete")
+            centerline_point = (
+                centers[level_index] + centers[level_index + 1]
+            ) * 0.5
+            outward = face.calc_center_median() - centerline_point
+            orientation = face.normal.dot(outward)
+            if abs(orientation) <= _GEOMETRY_EPSILON:
+                raise ValueError("A lateral face has an ambiguous orientation")
+            current_sign = 1 if orientation > 0.0 else -1
+            if winding_sign and current_sign != winding_sign:
+                raise ValueError("Lateral faces have inconsistent winding")
+            winding_sign = current_sign
+    return winding_sign
+
+
+def collect_curved_reduction_data(
+    analysis: CurvedTubeAnalysis,
+    target_segments: int,
+) -> CurvedReductionPlan:
+    """Validate and collect every value needed before destructive editing."""
+    if not analysis.valid:
+        raise ValueError(analysis.status)
+    current_segments = len(analysis.ordered_chains)
+    if target_segments < 3:
+        raise ValueError("Target must be at least 3")
+    if target_segments >= current_segments:
+        raise ValueError("Target must be lower than current segment count")
+    remove_count = current_segments - target_segments
+    if remove_count < 1:
+        raise ValueError("At least one segment must be removed")
+    if len(analysis.levels) < 2:
+        raise ValueError("At least two transverse levels are required")
+    if not analysis.frame_continuity:
+        raise ValueError("Frame continuity failed")
+
+    ordered_chains = order_curved_chains_circularly(analysis)
+    levels = build_longitudinal_levels(ordered_chains)
+    if len(levels) != len(analysis.level_info):
+        raise ValueError("Curved level data is incomplete")
+    for info in analysis.level_info:
+        _validate_orthonormal_frame(info.tangent, info.normal, info.binormal)
+
+    remove_indices = _uniform_removal_indices(current_segments, remove_count)
+    removal_set = set(remove_indices)
+    natural_survivors = tuple(
+        index for index in range(current_segments) if index not in removal_set
+    )
+    first_removed = remove_indices[0]
+    anchor_index = next(
+        index
+        for offset in range(1, current_segments + 1)
+        for index in ((first_removed + offset) % current_segments,)
+        if index not in removal_set
+    )
+    anchor_position = natural_survivors.index(anchor_index)
+    survivor_indices = (
+        natural_survivors[anchor_position:] + natural_survivors[:anchor_position]
+    )
+    if len(survivor_indices) != target_segments:
+        raise ValueError("The requested number of surviving chains was not produced")
+    survivor_chains = tuple(ordered_chains[index] for index in survivor_indices)
+
+    centers = tuple(info.center.copy() for info in analysis.level_info)
+    tangents = tuple(info.tangent.copy() for info in analysis.level_info)
+    normals = tuple(info.normal.copy() for info in analysis.level_info)
+    binormals = tuple(info.binormal.copy() for info in analysis.level_info)
+    radii = tuple(info.average_radius for info in analysis.level_info)
+    if any(radius <= _GEOMETRY_EPSILON for radius in radii):
+        raise ValueError("A transverse level has a degenerate radius")
+    reference_angles = calculate_reference_angles_per_level(
+        survivor_chains[0], analysis.level_info
+    )
+
+    axial_offsets = []
+    for level_index, info in enumerate(analysis.level_info):
+        raw_offsets = tuple(
+            (chain[level_index].co - info.center).dot(info.tangent)
+            for chain in survivor_chains
+        )
+        average_offset = sum(raw_offsets) / len(raw_offsets)
+        centered_offsets = tuple(value - average_offset for value in raw_offsets)
+        offset_limit = max(
+            _GEOMETRY_EPSILON * 10.0,
+            info.average_radius * _CURVE_AXIAL_OFFSET_LIMIT_RATIO,
+        )
+        if any(abs(value) > offset_limit for value in centered_offsets):
+            raise ValueError("A level contains anomalous axial offsets")
+        axial_offsets.append(centered_offsets)
+
+    edges_to_dissolve = tuple(
+        edge
+        for index in remove_indices
+        for first, second in zip(ordered_chains[index], ordered_chains[index][1:])
+        for edge in (_find_connecting_edge(first, second),)
+        if edge is not None
+    )
+    expected_edge_count = remove_count * (len(levels) - 1)
+    if (
+        len(edges_to_dissolve) != expected_edge_count
+        or len(set(edges_to_dissolve)) != expected_edge_count
+    ):
+        raise ValueError("Could not resolve every curved chain marked for removal")
+
+    cap_faces = _endpoint_cap_faces(levels)
+    lateral_winding_sign = _calculate_lateral_winding_sign(
+        ordered_chains, centers
+    )
+    return CurvedReductionPlan(
+        current_segments=current_segments,
+        target_segments=target_segments,
+        remove_indices=remove_indices,
+        survivor_indices=survivor_indices,
+        ordered_chains=ordered_chains,
+        survivor_chains=survivor_chains,
+        levels=levels,
+        centers=centers,
+        tangents=tangents,
+        normals=normals,
+        binormals=binormals,
+        radii=radii,
+        reference_angles=reference_angles,
+        axial_offsets=tuple(axial_offsets),
+        edges_to_dissolve=edges_to_dissolve,
+        cap_presence=tuple(face is not None for face in cap_faces),
+        cap_normals=tuple(
+            face.normal.copy() if face is not None else None for face in cap_faces
+        ),
+        cap_material_indices=tuple(
+            face.material_index if face is not None else None for face in cap_faces
+        ),
+        lateral_winding_sign=lateral_winding_sign,
+    )
+
+
+def redistribute_curved_survivors(plan: CurvedReductionPlan) -> None:
+    """Redistribute survivors in each transported local frame."""
+    angle_step = math.tau / plan.target_segments
+    for level_index in range(len(plan.centers)):
+        center = plan.centers[level_index]
+        tangent = plan.tangents[level_index]
+        normal = plan.normals[level_index]
+        binormal = plan.binormals[level_index]
+        radius = plan.radii[level_index]
+        start_angle = plan.reference_angles[level_index]
+        for chain_index, chain in enumerate(plan.survivor_chains):
+            vertex = chain[level_index]
+            if not vertex.is_valid:
+                raise RuntimeError("A curved survivor vertex was removed unexpectedly")
+            angle = start_angle + chain_index * angle_step
+            radial_direction = (
+                math.cos(angle) * normal + math.sin(angle) * binormal
+            )
+            vertex.co = (
+                center
+                + plan.axial_offsets[level_index][chain_index] * tangent
+                + radius * radial_direction
+            )
+
+
+def select_curved_survivors(
+    edit_mesh: Any,
+    survivor_chains: Sequence[Sequence[Any]],
+) -> None:
+    """Leave only valid longitudinal survivor chains selected."""
+    for vertex in edit_mesh.verts:
+        vertex.select = False
+    for edge in edit_mesh.edges:
+        edge.select = False
+    for face in edit_mesh.faces:
+        face.select = False
+    for chain in survivor_chains:
+        for vertex in chain:
+            if not vertex.is_valid:
+                raise RuntimeError("A curved survivor vertex became invalid")
+            vertex.select = True
+        for first, second in zip(chain, chain[1:]):
+            edge = _find_connecting_edge(first, second)
+            if edge is None or not edge.is_valid:
+                raise RuntimeError("A curved survivor edge is missing")
+            edge.select = True
+
+
+def validate_curved_result(
+    edit_mesh: Any,
+    plan: CurvedReductionPlan,
+) -> None:
+    """Validate geometry, winding, caps, centers, radii, and selection."""
+    survivor_levels = build_longitudinal_levels(plan.survivor_chains)
+    if any(not vertex.is_valid for level in survivor_levels for vertex in level):
+        raise RuntimeError("Curved reduction left invalid survivor references")
+    if len(plan.survivor_chains) != plan.target_segments:
+        raise RuntimeError("Curved reduction produced the wrong chain count")
+    _validate_circular_structure(plan.survivor_chains)
+
+    geometry_scale = max(
+        max(plan.radii),
+        max(
+            (second - first).length
+            for first, second in zip(plan.centers, plan.centers[1:])
+        ),
+    )
+    tolerance = max(
+        _GEOMETRY_EPSILON * 100.0,
+        geometry_scale * _CURVE_RESULT_TOLERANCE_RATIO,
+    )
+    calculated_centers = calculate_level_centers(survivor_levels)
+    for expected, calculated in zip(plan.centers, calculated_centers):
+        if (expected - calculated).length > tolerance:
+            raise RuntimeError("Curved reduction changed the centerline")
+    for level_index, level in enumerate(survivor_levels):
+        _, minimum, maximum, radii = calculate_level_radius_data(
+            level,
+            plan.centers[level_index],
+            plan.tangents[level_index],
+        )
+        expected_radius = plan.radii[level_index]
+        if any(abs(radius - expected_radius) > tolerance for radius in radii):
+            raise RuntimeError("Curved reduction did not preserve a level radius")
+        if maximum - minimum > tolerance:
+            raise RuntimeError("Curved reduction produced a non-circular level")
+
+    if any(not vertex.link_edges for vertex in edit_mesh.verts):
+        raise RuntimeError("Curved reduction produced loose vertices")
+    if any(not edge.link_faces for edge in edit_mesh.edges):
+        raise RuntimeError("Curved reduction produced loose edges")
+    if any(face.calc_area() <= _GEOMETRY_EPSILON for face in edit_mesh.faces):
+        raise RuntimeError("Curved reduction produced a degenerate face")
+    if _calculate_lateral_winding_sign(
+        plan.survivor_chains, plan.centers
+    ) != plan.lateral_winding_sign:
+        raise RuntimeError("Curved reduction inverted lateral face winding")
+
+    cap_faces = _endpoint_cap_faces(survivor_levels)
+    for index, cap in enumerate(cap_faces):
+        if (cap is not None) != plan.cap_presence[index]:
+            raise RuntimeError("Curved reduction changed endpoint closure")
+        if cap is None:
+            continue
+        if len(cap.verts) != plan.target_segments:
+            raise RuntimeError("Curved reduction produced an invalid end cap")
+        if cap.normal.dot(plan.cap_normals[index]) <= 0.0:
+            raise RuntimeError("Curved reduction inverted an end cap")
+        if cap.material_index != plan.cap_material_indices[index]:
+            raise RuntimeError("Curved reduction changed an end-cap material")
+
+    expected_selected_vertices = plan.target_segments * len(plan.centers)
+    expected_selected_edges = plan.target_segments * (len(plan.centers) - 1)
+    if sum(vertex.select for vertex in edit_mesh.verts) != expected_selected_vertices:
+        raise RuntimeError("Curved reduction left an invalid vertex selection")
+    if sum(edge.select for edge in edit_mesh.edges) != expected_selected_edges:
+        raise RuntimeError("Curved reduction left an invalid edge selection")
+    if any(face.select for face in edit_mesh.faces):
+        raise RuntimeError("Curved reduction selected faces unexpectedly")
+
+
+def reduce_curved_tube(
+    edit_mesh: Any,
+    plan: CurvedReductionPlan,
+) -> CurvedReductionResult:
+    """Dissolve, redistribute, select, and validate one curved reduction."""
+    before = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
+    bmesh.ops.dissolve_edges(
+        edit_mesh,
+        edges=plan.edges_to_dissolve,
+        use_verts=True,
+        use_face_split=False,
+    )
+    edit_mesh.verts.ensure_lookup_table()
+    edit_mesh.edges.ensure_lookup_table()
+    edit_mesh.faces.ensure_lookup_table()
+    redistribute_curved_survivors(plan)
+    select_curved_survivors(edit_mesh, plan.survivor_chains)
+    edit_mesh.normal_update()
+    validate_curved_result(edit_mesh, plan)
+    after = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
+    return CurvedReductionResult(
+        success=True,
+        message=(
+            f"Reduced curved tube: {plan.current_segments} → "
+            f"{plan.target_segments} | Levels: {len(plan.centers)}"
+        ),
+        vertex_count_before=before[0],
+        vertex_count_after=after[0],
+        edge_count_before=before[1],
+        edge_count_after=after[1],
+        face_count_before=before[2],
+        face_count_after=after[2],
+    )
 
 
 def _uniform_removal_indices(current: int, remove_count: int) -> tuple[int, ...]:
