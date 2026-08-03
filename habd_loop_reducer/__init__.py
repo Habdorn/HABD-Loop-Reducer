@@ -15,18 +15,6 @@ from .operators import classes as operator_classes
 from .panel import classes as panel_classes
 
 
-bl_info = {
-    "name": "HABD Loop Reducer",
-    "author": "Habdorn",
-    "version": (0, 2, 0),
-    "blender": (5, 2, 0),
-    "location": "View3D > Sidebar > HABD",
-    "description": "Reducción controlada de loops y segmentos en mallas",
-    "support": "COMMUNITY",
-    "category": "Mesh",
-}
-
-
 class HABD_LR_Properties(PropertyGroup):
     """Scene-level options used by HABD Loop Reducer."""
 

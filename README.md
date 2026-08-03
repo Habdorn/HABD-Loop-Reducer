@@ -69,6 +69,10 @@ Use Curved mode for bent pipes, hoses, S-shaped tubes, tubes with multiple bends
 
 Always test destructive topology operations on a copy of important production meshes.
 
+## Blender Extensions
+
+The repository supports official Blender Extension packaging through `blender_manifest.toml`. Version 0.2.0 may still be pending review on the Blender Extensions platform.
+
 Example reductions include:
 
 - Straight cylinder: 32 → 30
@@ -108,7 +112,6 @@ Example reductions include:
 - Shape-preserving support for oval sections.
 - Support for additional cap topologies.
 - Better viewport feedback and previews.
-- Blender Extensions packaging.
 - Automated test suite and continuous integration.
 - Additional topology validation.
 - Optional preview of chains selected for removal.

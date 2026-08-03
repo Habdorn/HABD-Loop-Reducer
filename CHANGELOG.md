@@ -8,6 +8,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
 ### Added
 
+- Added official Blender Extension packaging support.
 - Straight and Curved geometry modes.
 - Non-destructive curved tube analysis.
 - Destructive segment reduction for curved tubes and hoses.
