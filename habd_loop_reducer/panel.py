@@ -21,7 +21,57 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
         layout.label(text="HABD Loop Reducer")
         layout.prop(settings, "geometry_mode", text="Geometry Mode")
 
-        if settings.geometry_mode == "CURVED":
+        if settings.geometry_mode == "PROFILE":
+            analyze_row = layout.row()
+            analyze_row.enabled = is_valid_edit_mesh_context(context)
+            analyze_row.operator(
+                "mesh.habd_analyze_profile",
+                text="Analyze Profile",
+            )
+
+            profile_box = layout.box()
+            profile_box.label(text="Profile Analysis")
+            profile_box.label(text=f"Type: {settings.profile_type.title()}")
+            if settings.profile_region_count:
+                profile_box.label(
+                    text=f"Regions: {settings.profile_region_count}"
+                )
+            profile_box.label(text=f"Levels: {settings.profile_level_count}")
+            current_samples = (
+                settings.profile_sample_summary
+                if settings.profile_region_count
+                else str(settings.current_segments)
+            )
+            profile_box.label(text=f"Current Samples: {current_samples}")
+            profile_box.prop(settings, "target_segments", text="Target Samples")
+            change = settings.target_segments - settings.current_segments
+            if settings.current_segments:
+                profile_box.label(text=f"Change per Region: {change:+d}")
+            elif settings.profile_region_count:
+                profile_box.label(text="Change per Region: Mixed")
+            profile_box.label(text=f"Status: {settings.profile_status}")
+
+            profile_ready = (
+                settings.profile_analysis_valid
+                and settings.target_segments >= 3
+                and settings.target_segments != settings.current_segments
+            )
+            guidance = layout.column()
+            guidance.alert = not profile_ready
+            if profile_ready:
+                guidance.label(text="Profile resample ready")
+            elif settings.profile_analysis_valid:
+                guidance.label(text="Target already matches current samples")
+            else:
+                guidance.label(text="Analyze the profile before applying")
+            operator_row = layout.row()
+            operator_row.enabled = (
+                is_valid_edit_mesh_context(context) and profile_ready
+            )
+            operator_row.operator(
+                "mesh.habd_reduce_loops", text="Apply Segments"
+            )
+        elif settings.geometry_mode == "CURVED":
             analyze_row = layout.row()
             analyze_row.enabled = is_valid_edit_mesh_context(context)
             analyze_row.operator(
@@ -46,23 +96,25 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
             continuity = "Yes" if settings.curve_frame_continuity else "No"
             analysis_box.label(text=f"Frame Continuity: {continuity}")
 
-            reduction_ready = (
+            resample_ready = (
                 settings.curve_analysis_valid
-                and settings.target_segments < settings.current_segments
+                and settings.target_segments >= 3
+                and settings.target_segments != settings.current_segments
             )
             guidance = layout.column()
-            guidance.alert = not reduction_ready
-            if reduction_ready:
-                guidance.label(text="Curved reduction ready")
+            guidance.alert = not resample_ready
+            if resample_ready:
+                change = settings.target_segments - settings.current_segments
+                guidance.label(text=f"Curved resample ready ({change:+d})")
             elif settings.curve_analysis_valid:
-                guidance.label(text="Target must be lower than current segments")
+                guidance.label(text="Target already matches current segments")
             else:
-                guidance.label(text="Analyze the curved tube before reducing")
+                guidance.label(text="Analyze the curved tube before applying")
             operator_row = layout.row()
             operator_row.enabled = (
-                is_valid_edit_mesh_context(context) and reduction_ready
+                is_valid_edit_mesh_context(context) and resample_ready
             )
-            operator_row.operator("mesh.habd_reduce_loops", text="Reduce Loops")
+            operator_row.operator("mesh.habd_reduce_loops", text="Apply Segments")
         else:
             detect_row = layout.row()
             detect_row.enabled = is_valid_edit_mesh_context(context)
@@ -71,7 +123,8 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
             results = layout.column(align=True)
             results.label(text=f"Current Segments: {settings.current_segments}")
             results.prop(settings, "target_segments", text="Target Segments")
-            results.label(text=f"Segments to Remove: {settings.segments_to_remove}")
+            change = settings.target_segments - settings.current_segments
+            results.label(text=f"Change: {change:+d}")
             compatible_text = "Yes" if settings.selection_compatible else "No"
             results.label(text=f"Compatible: {compatible_text}")
             results.label(text=f"Status: {settings.selection_status}")
@@ -80,8 +133,9 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
             operator_row.enabled = (
                 is_valid_edit_mesh_context(context)
                 and settings.selection_compatible
+                and settings.target_segments != settings.current_segments
             )
-            operator_row.operator("mesh.habd_reduce_loops", text="Reduce Loops")
+            operator_row.operator("mesh.habd_reduce_loops", text="Apply Segments")
 
 
 classes = (HABD_PT_loop_reducer,)

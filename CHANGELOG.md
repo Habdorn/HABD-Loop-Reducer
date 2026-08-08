@@ -4,6 +4,31 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.3.0] - 2026-08-08
+
+### Added
+
+- Bidirectional segment resampling with the target interpreted as the final count.
+- Increased radial segment counts for Straight and Curved geometry.
+- Profile geometry mode with accumulated-length, shape-preserving resampling.
+- Open and closed full-profile resampling.
+- Automatic bevel-region detection within compatible solid geometry.
+- Single- and multi-region bevel resampling, including regions with different current sample counts.
+- Preservation of compatible flat areas, profile boundary rails, exterior geometry, materials, custom data, and ngon caps.
+
+### Improved
+
+- Curved and S-curve resampling for both lower and higher target counts.
+- Target semantics and no-op handling when Target matches Current.
+- Interface wording and feedback, including **Apply Segments** and signed **Change** values.
+- Pre-mutation planning, topology validation, post-operation reanalysis, and geometry checks.
+
+### Fixed
+
+- Fixed `External geometry is attached inside the open profile` for valid integrated bevel regions on solids.
+- Prevented FULL_OPEN external-geometry validation from being reused for BEVEL_REGIONS.
+- Fixed a single integrated bevel not being classified as `Regions = 1`.
+
 ## [0.2.0] - 2026-08-02
 
 ### Added

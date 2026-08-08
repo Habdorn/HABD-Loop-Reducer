@@ -20,7 +20,7 @@ class HABD_LR_Properties(PropertyGroup):
 
     target_segments: IntProperty(
         name="Target Segments",
-        description="Desired number of segments for the loop reduction",
+        description="Final number of radial segments or profile samples",
         default=18,
         min=3,
         max=10_000,
@@ -31,13 +31,13 @@ class HABD_LR_Properties(PropertyGroup):
         default=0,
     )
     segments_to_remove: IntProperty(
-        name="Segments to Remove",
-        description="Difference between the current and target segment counts",
+        name="Segment Difference",
+        description="Legacy current-minus-target segment difference",
         default=0,
     )
     selection_compatible: BoolProperty(
         name="Compatible",
-        description="Whether the selected chains are compatible with reduction",
+        description="Whether the selected chains are compatible with resampling",
         default=False,
     )
     selection_status: StringProperty(
@@ -47,10 +47,15 @@ class HABD_LR_Properties(PropertyGroup):
     )
     geometry_mode: EnumProperty(
         name="Geometry Mode",
-        description="Choose straight reduction or non-destructive curved analysis",
+        description="Choose straight or curved tube resampling",
         items=(
-            ("STRAIGHT", "Straight", "Use the stable straight-cylinder workflow"),
-            ("CURVED", "Curved", "Analyze a curved tubular surface"),
+            ("STRAIGHT", "Straight", "Resample a straight circular tube"),
+            ("CURVED", "Curved", "Analyze and resample a curved circular tube"),
+            (
+                "PROFILE",
+                "Profile",
+                "Resample an open or closed profile by cumulative length",
+            ),
         ),
         default="STRAIGHT",
     )
@@ -108,6 +113,38 @@ class HABD_LR_Properties(PropertyGroup):
         name="Status",
         description="Result of the most recent curved tube analysis",
         default="No curved analysis performed",
+    )
+    profile_analysis_valid: BoolProperty(
+        name="Valid Profile",
+        description="Whether the most recent PROFILE analysis is compatible",
+        default=False,
+    )
+    profile_type: StringProperty(
+        name="Profile Type",
+        description="Automatically detected open or closed profile topology",
+        default="UNKNOWN",
+    )
+    profile_level_count: IntProperty(
+        name="Profile Levels",
+        description="Number of corresponding transverse profile levels",
+        default=0,
+        min=0,
+    )
+    profile_region_count: IntProperty(
+        name="Profile Regions",
+        description="Number of automatically detected bevel regions",
+        default=0,
+        min=0,
+    )
+    profile_sample_summary: StringProperty(
+        name="Current Profile Samples",
+        description="Current sample count for each detected profile region",
+        default="0",
+    )
+    profile_status: StringProperty(
+        name="Profile Status",
+        description="Result of the most recent PROFILE analysis",
+        default="No profile analysis performed",
     )
 
 
