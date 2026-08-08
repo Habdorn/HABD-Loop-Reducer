@@ -7,11 +7,19 @@ import bmesh
 
 from .utils import (
     analyze_curved_tube,
+    analyze_profile,
     analyze_selected_chains,
+    build_profile_regions_plan,
+    build_profile_resample_plan,
     build_reduction_plan,
+    build_straight_increase_plan,
+    collect_curved_increase_data,
     collect_curved_reduction_data,
+    increase_tube_segments,
     is_valid_edit_mesh_context,
     reduce_curved_tube,
+    resample_profile,
+    resample_profile_regions,
     redistribute_surviving_chains,
 )
 
@@ -26,6 +34,39 @@ def _store_curved_analysis(settings, analysis) -> None:
     settings.curve_max_turn_angle = analysis.max_turn_angle
     settings.curve_frame_continuity = analysis.frame_continuity
     settings.curve_status = analysis.status
+
+
+def _store_profile_analysis(settings, analysis) -> None:
+    """Copy PROFILE analysis values into RNA properties for display."""
+    settings.profile_analysis_valid = analysis.valid
+    settings.profile_type = (
+        "BEVEL REGIONS"
+        if analysis.regions
+        else (
+            analysis.profile_type.value
+            if analysis.profile_type is not None
+            else "UNKNOWN"
+        )
+    )
+    settings.profile_level_count = len(analysis.levels)
+    settings.profile_region_count = len(analysis.regions)
+    region_counts = tuple(
+        region.current_segments for region in analysis.regions
+    )
+    settings.profile_sample_summary = (
+        ", ".join(str(count) for count in region_counts)
+        if region_counts
+        else str(len(analysis.ordered_chains))
+    )
+    settings.profile_status = analysis.status
+
+
+def _profile_current_segments(analysis) -> int:
+    """Return one current count when all detected regions agree."""
+    if not analysis.regions:
+        return len(analysis.ordered_chains)
+    counts = {region.current_segments for region in analysis.regions}
+    return counts.pop() if len(counts) == 1 else 0
 
 
 class HABD_OT_detect_segments(bpy.types.Operator):
@@ -58,10 +99,10 @@ class HABD_OT_detect_segments(bpy.types.Operator):
         summary = (
             f"Current: {analysis.current_segments} | "
             f"Target: {settings.target_segments} | "
-            f"Remove: {analysis.segments_to_remove} | "
+            f"Change: {-analysis.segments_to_remove:+d} | "
             f"Compatible: {compatible_text}"
         )
-        has_warning = analysis.status != "Selection is compatible"
+        has_warning = not analysis.compatible
         report_level = {"WARNING"} if has_warning else {"INFO"}
         self.report(report_level, summary)
         print(summary)
@@ -116,12 +157,50 @@ class HABD_OT_analyze_curved_tube(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class HABD_OT_analyze_profile(bpy.types.Operator):
+    """Analyze selected longitudinal chains as a PROFILE band."""
+
+    bl_idname = "mesh.habd_analyze_profile"
+    bl_label = "Analyze Profile"
+    bl_description = "Detect an open or closed profile band without changing geometry"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return is_valid_edit_mesh_context(context)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        settings = context.scene.habd_loop_reducer
+        edit_mesh = bmesh.from_edit_mesh(context.active_object.data)
+        selected_edges = tuple(edge for edge in edit_mesh.edges if edge.select)
+        analysis = analyze_profile(selected_edges)
+        _store_profile_analysis(settings, analysis)
+        settings.current_segments = _profile_current_segments(analysis)
+        settings.segments_to_remove = (
+            settings.current_segments - settings.target_segments
+        )
+        settings.selection_compatible = analysis.valid
+        settings.selection_status = analysis.status
+        if not analysis.valid:
+            self.report({"WARNING"}, analysis.status)
+            return {"CANCELLED"}
+        summary = (
+            f"{settings.profile_type.title()} | "
+            f"Regions: {len(analysis.regions)} | "
+            f"Samples: {settings.profile_sample_summary} | "
+            f"Levels: {len(analysis.levels)}"
+        )
+        self.report({"INFO"}, summary)
+        print(summary)
+        return {"FINISHED"}
+
+
 class HABD_OT_reduce_loops(bpy.types.Operator):
-    """Reduce selected longitudinal chains and redistribute the survivors."""
+    """Resample selected longitudinal chains to the requested radial count."""
 
     bl_idname = "mesh.habd_reduce_loops"
-    bl_label = "Reduce Loops"
-    bl_description = "Reduce and evenly redistribute segments around the selected mesh surface"
+    bl_label = "Apply Segments"
+    bl_description = "Resample the selected mesh surface to the requested final count"
     bl_options = {"REGISTER", "UNDO"}
 
     @classmethod
@@ -133,12 +212,14 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
         if not is_valid_edit_mesh_context(context):
             self.report({"ERROR"}, "An active mesh must be in Edit Mode")
             return {"CANCELLED"}
+        if settings.geometry_mode == "PROFILE":
+            return self._execute_profile(context, settings)
         if settings.geometry_mode == "CURVED":
             return self._execute_curved(context, settings)
 
         active_object = context.active_object
         if active_object.data.shape_keys is not None:
-            self.report({"ERROR"}, "Reduction is disabled for meshes with shape keys")
+            self.report({"ERROR"}, "Segment resampling is disabled for meshes with shape keys")
             return {"CANCELLED"}
 
         mesh = active_object.data
@@ -153,6 +234,34 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
         if not analysis.compatible:
             self.report({"ERROR"}, analysis.status)
             return {"CANCELLED"}
+
+        current_segments = analysis.current_segments
+        if target_segments == current_segments:
+            settings.selection_status = "Target matches current segments; no changes made"
+            self.report({"INFO"}, settings.selection_status)
+            return {"FINISHED"}
+
+        if target_segments > current_segments:
+            try:
+                plan = build_straight_increase_plan(
+                    selected_edges, target_segments
+                )
+                result = increase_tube_segments(
+                    edit_mesh, plan, curved=False
+                )
+            except (ValueError, RuntimeError) as error:
+                settings.selection_compatible = False
+                settings.selection_status = str(error)
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
+            bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+            settings.current_segments = target_segments
+            settings.segments_to_remove = 0
+            settings.selection_compatible = False
+            settings.selection_status = "Increase completed; run detection again"
+            self.report({"INFO"}, result.message)
+            print(result.message)
+            return {"FINISHED"}
 
         try:
             plan = build_reduction_plan(selected_edges, target_segments)
@@ -204,11 +313,77 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
 
         return {"FINISHED"}
 
-    def _execute_curved(self, context, settings) -> set[str]:
-        """Reanalyze and reduce one compatible curved tubular selection."""
+    def _execute_profile(self, context, settings) -> set[str]:
+        """Reanalyze and resample one compatible PROFILE band."""
         active_object = context.active_object
         if active_object.data.shape_keys is not None:
-            self.report({"ERROR"}, "Reduction is disabled for meshes with shape keys")
+            self.report(
+                {"ERROR"},
+                "Profile resampling is disabled for meshes with shape keys",
+            )
+            return {"CANCELLED"}
+
+        mesh = active_object.data
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        selected_edges = tuple(edge for edge in edit_mesh.edges if edge.select)
+        analysis = analyze_profile(selected_edges)
+        _store_profile_analysis(settings, analysis)
+        settings.current_segments = _profile_current_segments(analysis)
+        settings.segments_to_remove = (
+            settings.current_segments - settings.target_segments
+        )
+        settings.selection_compatible = analysis.valid
+        settings.selection_status = analysis.status
+        if not analysis.valid:
+            self.report({"ERROR"}, analysis.status)
+            return {"CANCELLED"}
+
+        target_segments = settings.target_segments
+        if target_segments < 3:
+            self.report({"ERROR"}, "Target must be at least 3 profile samples")
+            return {"CANCELLED"}
+        current_counts = (
+            tuple(region.current_segments for region in analysis.regions)
+            if analysis.regions
+            else (len(analysis.ordered_chains),)
+        )
+        if all(count == target_segments for count in current_counts):
+            settings.profile_status = "Target matches current profile samples; no changes made"
+            settings.selection_status = settings.profile_status
+            self.report({"INFO"}, settings.profile_status)
+            return {"FINISHED"}
+
+        try:
+            if analysis.regions:
+                plan = build_profile_regions_plan(analysis, target_segments)
+                result = resample_profile_regions(edit_mesh, plan)
+            else:
+                plan = build_profile_resample_plan(analysis, target_segments)
+                result = resample_profile(edit_mesh, plan)
+        except (ValueError, RuntimeError) as error:
+            settings.profile_analysis_valid = False
+            settings.selection_compatible = False
+            settings.profile_status = str(error)
+            settings.selection_status = str(error)
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+        settings.current_segments = target_segments
+        settings.segments_to_remove = 0
+        settings.selection_compatible = False
+        settings.profile_analysis_valid = False
+        settings.profile_status = "Profile resampling completed; analyze again"
+        settings.selection_status = settings.profile_status
+        self.report({"INFO"}, result.message)
+        print(result.message)
+        return {"FINISHED"}
+
+    def _execute_curved(self, context, settings) -> set[str]:
+        """Reanalyze and resample one compatible curved tubular selection."""
+        active_object = context.active_object
+        if active_object.data.shape_keys is not None:
+            self.report({"ERROR"}, "Segment resampling is disabled for meshes with shape keys")
             return {"CANCELLED"}
 
         mesh = active_object.data
@@ -224,6 +399,35 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
         if not analysis.valid:
             self.report({"ERROR"}, analysis.status)
             return {"CANCELLED"}
+
+        current_segments = len(analysis.ordered_chains)
+        target_segments = settings.target_segments
+        if target_segments < 3:
+            self.report({"ERROR"}, "Target must be at least 3")
+            return {"CANCELLED"}
+        if target_segments == current_segments:
+            settings.curve_status = "Target matches current segments; no changes made"
+            self.report({"INFO"}, settings.curve_status)
+            return {"FINISHED"}
+        if target_segments > current_segments:
+            try:
+                plan = collect_curved_increase_data(analysis, target_segments)
+                result = increase_tube_segments(edit_mesh, plan, curved=True)
+            except (ValueError, RuntimeError) as error:
+                settings.curve_analysis_valid = False
+                settings.selection_compatible = False
+                settings.curve_status = str(error)
+                self.report({"ERROR"}, str(error))
+                return {"CANCELLED"}
+            bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+            settings.current_segments = target_segments
+            settings.segments_to_remove = 0
+            settings.selection_compatible = False
+            settings.curve_analysis_valid = False
+            settings.curve_status = "Curved increase completed; analyze again"
+            self.report({"INFO"}, result.message)
+            print(result.message)
+            return {"FINISHED"}
 
         edit_mesh.normal_update()
         try:
@@ -254,5 +458,6 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
 classes = (
     HABD_OT_detect_segments,
     HABD_OT_analyze_curved_tube,
+    HABD_OT_analyze_profile,
     HABD_OT_reduce_loops,
 )

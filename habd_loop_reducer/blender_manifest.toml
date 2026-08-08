@@ -1,0 +1,26 @@
+schema_version = "1.0.0"
+
+id = "habd_loop_reducer"
+version = "0.3.0"
+name = "HABD Loop Reducer"
+tagline = "Resample segments on tubes and profiles"
+maintainer = "Habdorn"
+type = "add-on"
+
+website = "https://github.com/Habdorn/HABD-Loop-Reducer"
+
+tags = ["Mesh"]
+
+blender_version_min = "5.2.0"
+
+license = [
+    "SPDX:GPL-3.0-or-later",
+]
+
+[build]
+paths = [
+    "__init__.py",
+    "operators.py",
+    "panel.py",
+    "utils.py",
+]
