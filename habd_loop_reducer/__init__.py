@@ -18,6 +18,16 @@ from .panel import classes as panel_classes
 class HABD_LR_Properties(PropertyGroup):
     """Scene-level options used by HABD Loop Reducer."""
 
+    resample_direction: EnumProperty(
+        name="Resample Direction",
+        description="Resample around a section or along a bend",
+        items=(
+            ("RADIAL", "Radial", "Use the existing Straight, Curved, or Profile pipelines"),
+            ("LONGITUDINAL", "Longitudinal", "Resample cross-sections along a bend"),
+        ),
+        default="RADIAL",
+    )
+
     target_segments: IntProperty(
         name="Target Segments",
         description="Final number of radial segments or profile samples",
@@ -145,6 +155,72 @@ class HABD_LR_Properties(PropertyGroup):
         name="Profile Status",
         description="Result of the most recent PROFILE analysis",
         default="No profile analysis performed",
+    )
+    longitudinal_analysis_valid: BoolProperty(
+        name="Valid Bend",
+        description="Whether the most recent longitudinal analysis is compatible",
+        default=False,
+    )
+    longitudinal_section_type: StringProperty(
+        name="Cross-Section",
+        description="Detected open or closed transverse topology",
+        default="UNKNOWN",
+    )
+    longitudinal_selection_kind: StringProperty(
+        name="Input",
+        description="Automatically detected Rails or Cross Loops input",
+        default="UNKNOWN",
+    )
+    longitudinal_path_shape: EnumProperty(
+        name="Path Shape",
+        description=(
+            "Preserve the source polyline or reconstruct a smooth centerline"
+        ),
+        items=(
+            (
+                "PRESERVE",
+                "Preserve",
+                "Keep the current longitudinal polyline shape",
+            ),
+            (
+                "SMOOTH",
+                "Smooth",
+                "Reconstruct a smooth longitudinal centerline",
+            ),
+        ),
+        default="PRESERVE",
+    )
+    longitudinal_current_cuts: IntProperty(
+        name="Current Cuts",
+        description="Interior cross-sections between Base A and Base B",
+        default=0,
+        min=0,
+    )
+    longitudinal_target_cuts: IntProperty(
+        name="Target Cuts",
+        description="Final number of interior cross-sections between both bases",
+        default=1,
+        min=1,
+        max=10_000,
+    )
+    longitudinal_level_count: IntProperty(
+        name="Levels",
+        description="Total cross-sections including Base A and Base B",
+        default=0,
+        min=0,
+    )
+    longitudinal_path_length: FloatProperty(
+        name="Path Length",
+        description="Accumulated centerline length between both bases",
+        default=0.0,
+        min=0.0,
+        unit="LENGTH",
+        precision=4,
+    )
+    longitudinal_status: StringProperty(
+        name="Bend Status",
+        description="Result of the most recent longitudinal analysis",
+        default="No longitudinal analysis performed",
     )
 
 

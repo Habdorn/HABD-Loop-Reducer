@@ -16,6 +16,10 @@ _FRAME_FLIP_DOT_THRESHOLD = -0.95
 _CURVE_PLANARITY_TOLERANCE = 0.05
 _CURVE_MEAN_PLANARITY_TOLERANCE = 0.025
 _CURVE_RESULT_TOLERANCE_RATIO = 1.0e-5
+# BMesh stores coordinates as float32.  Staged Increase geometry is compared
+# against the planner's frozen positions with a small absolute + scale term.
+_INCREASE_POSITION_ABSOLUTE_TOLERANCE = 1.0e-6
+_INCREASE_POSITION_RELATIVE_TOLERANCE = 2.0e-7
 _PROFILE_FLAT_ANGLE_TOLERANCE = math.radians(2.0)
 _PROFILE_MAX_BEVEL_TURN = math.radians(80.0)
 _PROFILE_ISOLATED_FLAT_LENGTH_RATIO = 1.75
@@ -82,6 +86,27 @@ class ProfileStructure(str, Enum):
     FULL_OPEN = "FULL_OPEN"
     FULL_CLOSED = "FULL_CLOSED"
     BEVEL_REGIONS = "BEVEL_REGIONS"
+
+
+class LongitudinalSectionType(str, Enum):
+    """Transverse boundary topology for longitudinal bend resampling."""
+
+    OPEN = "OPEN"
+    CLOSED = "CLOSED"
+
+
+class LongitudinalSelectionKind(str, Enum):
+    """Topological input representation accepted by Analyze Bend."""
+
+    RAILS = "RAILS"
+    CROSS_LOOPS = "CROSS_LOOPS"
+
+
+class LongitudinalPathShape(str, Enum):
+    """Centerline reconstruction used for longitudinal target levels."""
+
+    PRESERVE = "PRESERVE"
+    SMOOTH = "SMOOTH"
 
 
 @dataclass(frozen=True)
@@ -163,6 +188,7 @@ class RadialIncreasePlan:
     radii: tuple[float, ...]
     reference_angles: tuple[float, ...]
     axial_offsets: tuple[tuple[float, ...], ...]
+    target_positions: tuple[tuple[Vector, ...], ...]
     lateral_faces: tuple[tuple[Any, ...], ...]
     end_types: tuple[TubeEndType, TubeEndType]
     cap_faces: tuple[Any | None, Any | None]
@@ -285,6 +311,72 @@ class ProfileRegionsResult:
     success: bool
     message: str
     region_count: int
+    vertex_count_before: int
+    vertex_count_after: int
+    edge_count_before: int
+    edge_count_after: int
+    face_count_before: int
+    face_count_after: int
+
+
+@dataclass(frozen=True)
+class LongitudinalAnalysis:
+    """Connectivity-derived description of one bend between two bases."""
+
+    valid: bool
+    status: str
+    selection_kind: LongitudinalSelectionKind | None
+    section_type: LongitudinalSectionType | None
+    ordered_chains: tuple[tuple[Any, ...], ...]
+    levels: tuple[tuple[Any, ...], ...]
+    band_faces: tuple[tuple[Any, ...], ...]
+    centers: tuple[Vector, ...]
+    cumulative_lengths: tuple[float, ...]
+    path_length: float
+    base_edges: tuple[tuple[Any, ...], tuple[Any, ...]]
+    external_elements: tuple[Any, ...]
+
+    @property
+    def current_cuts(self) -> int:
+        """Return the number of editable levels between the two bases."""
+        return max(0, len(self.levels) - 2)
+
+
+@dataclass(frozen=True)
+class LongitudinalResamplePlan:
+    """Immutable, fully validated plan for rebuilding one bend interior."""
+
+    section_type: LongitudinalSectionType
+    path_shape: LongitudinalPathShape
+    current_cuts: int
+    target_cuts: int
+    ordered_chains: tuple[tuple[Any, ...], ...]
+    levels: tuple[tuple[Any, ...], ...]
+    band_faces: tuple[tuple[Any, ...], ...]
+    centers: tuple[Vector, ...]
+    cumulative_lengths: tuple[float, ...]
+    path_length: float
+    target_centers: tuple[Vector, ...]
+    target_path_length: float
+    positions: tuple[tuple[Vector, ...], ...]
+    position_sources: tuple[tuple[int, float], ...]
+    interval_sources: tuple[int, ...]
+    source_face_normals: tuple[tuple[Vector, ...], ...]
+    source_face_materials: tuple[tuple[int, ...], ...]
+    base_vertices: tuple[tuple[Any, ...], tuple[Any, ...]]
+    base_coordinates: tuple[tuple[Vector, ...], tuple[Vector, ...]]
+    base_edges: tuple[tuple[Any, ...], tuple[Any, ...]]
+    external_elements: tuple[Any, ...]
+
+
+@dataclass(frozen=True)
+class LongitudinalResampleResult:
+    """Final longitudinal chains, analysis, and topology counts."""
+
+    success: bool
+    message: str
+    chains: tuple[tuple[Any, ...], ...]
+    analysis: LongitudinalAnalysis
     vertex_count_before: int
     vertex_count_after: int
     edge_count_before: int
@@ -1695,6 +1787,30 @@ def _build_increase_plan(
         _interpolate_periodic_values(offsets, target_segments)
         for offsets in axial_offsets
     )
+    target_positions = tuple(
+        tuple(
+            (
+                centers[level_index]
+                + sampled_offsets[level_index][target_index]
+                * tangents[level_index]
+                + radii[level_index]
+                * (
+                    math.cos(
+                        reference_angles[level_index]
+                        + target_index * math.tau / target_segments
+                    )
+                    * normals[level_index]
+                    + math.sin(
+                        reference_angles[level_index]
+                        + target_index * math.tau / target_segments
+                    )
+                    * binormals[level_index]
+                )
+            ).copy()
+            for target_index in range(target_segments)
+        )
+        for level_index in range(len(levels))
+    )
     return RadialIncreasePlan(
         current_segments=current_segments,
         target_segments=target_segments,
@@ -1707,6 +1823,7 @@ def _build_increase_plan(
         radii=tuple(radii),
         reference_angles=tuple(reference_angles),
         axial_offsets=sampled_offsets,
+        target_positions=target_positions,
         lateral_faces=lateral_faces,
         end_types=tuple(info.end_type for info in end_infos),
         cap_faces=tuple(info.cap_face for info in end_infos),
@@ -1848,22 +1965,10 @@ def _create_increased_geometry(
     try:
         for level_index in range(level_count):
             level = []
-            center = plan.centers[level_index]
-            tangent = plan.tangents[level_index]
-            normal = plan.normals[level_index]
-            binormal = plan.binormals[level_index]
             for target_index in range(plan.target_segments):
-                angle = (
-                    plan.reference_angles[level_index]
-                    + target_index * math.tau / plan.target_segments
+                vertex = edit_mesh.verts.new(
+                    plan.target_positions[level_index][target_index]
                 )
-                coordinate = (
-                    center
-                    + plan.axial_offsets[level_index][target_index] * tangent
-                    + plan.radii[level_index]
-                    * (math.cos(angle) * normal + math.sin(angle) * binormal)
-                )
-                vertex = edit_mesh.verts.new(coordinate)
                 level.append(vertex)
                 created_vertices.append(vertex)
             new_levels.append(tuple(level))
@@ -1952,42 +2057,57 @@ def validate_increased_result(
     chains: Sequence[Sequence[Any]],
     before: tuple[int, int, int],
 ) -> None:
-    """Check counts, rings, connectivity, winding, ends, and selection."""
+    """Validate a staged replacement completely before deleting its source."""
     levels = build_longitudinal_levels(chains)
     if len(chains) != plan.target_segments or len(levels) != len(plan.levels):
         raise RuntimeError("Increase produced the wrong chain or level count")
     _validate_circular_structure(chains)
-    scale = max(max(plan.radii), 1.0)
-    tolerance = max(
-        _GEOMETRY_EPSILON * 100.0,
-        scale * _CURVE_RESULT_TOLERANCE_RATIO,
-    )
-    for level_index, level in enumerate(levels):
-        center = _mean_position(level)
-        if (center - plan.centers[level_index]).length > tolerance:
-            raise RuntimeError("Increase changed a transverse center")
-        angles = []
-        for vertex in level:
-            relative = vertex.co - plan.centers[level_index]
-            radial = relative - plan.tangents[level_index] * relative.dot(
-                plan.tangents[level_index]
-            )
-            if abs(radial.length - plan.radii[level_index]) > tolerance:
-                raise RuntimeError("Increase did not preserve a level radius")
-            angles.append(
-                math.atan2(
-                    radial.dot(plan.binormals[level_index]),
-                    radial.dot(plan.normals[level_index]),
-                )
-            )
-        unwrapped = unwrap_angle_sequence(angles)
-        expected_step = math.tau / plan.target_segments
-        differences = tuple(
-            (unwrapped[(index + 1) % len(unwrapped)] - unwrapped[index]) % math.tau
-            for index in range(len(unwrapped))
+
+    def position_tolerance(level_index: int) -> float:
+        coordinate_scale = max(
+            1.0,
+            plan.radii[level_index],
+            *(
+                abs(component)
+                for position in plan.target_positions[level_index]
+                for component in position
+            ),
         )
-        if any(abs(value - expected_step) > tolerance for value in differences):
-            raise RuntimeError("Increase produced non-uniform radial spacing")
+        return (
+            _INCREASE_POSITION_ABSOLUTE_TOLERANCE
+            + coordinate_scale * _INCREASE_POSITION_RELATIVE_TOLERANCE
+        )
+
+    # The first chain is only an anchor.  Accept one cyclic shift shared by
+    # every level, but never reverse winding.
+    first_level = levels[0]
+    first_targets = plan.target_positions[0]
+    best_offset = min(
+        range(plan.target_segments),
+        key=lambda offset: max(
+            (first_level[0].co - first_targets[offset]).length,
+            (
+                first_level[1].co
+                - first_targets[(offset + 1) % plan.target_segments]
+            ).length,
+        ),
+    )
+    best_errors = tuple(
+        (level[target_index].co - plan.target_positions[level_index][
+            (target_index + best_offset) % plan.target_segments
+        ]).length
+        for level_index, level in enumerate(levels)
+        for target_index in range(plan.target_segments)
+    )
+    error_index = 0
+    for level_index in range(len(levels)):
+        tolerance = position_tolerance(level_index)
+        level_errors = best_errors[
+            error_index:error_index + plan.target_segments
+        ]
+        error_index += plan.target_segments
+        if any(error > tolerance for error in level_errors):
+            raise RuntimeError("Increase result differs from planned radial positions")
 
     new_vertices = {vertex for level in levels for vertex in level}
     new_edges = {edge for vertex in new_vertices for edge in vertex.link_edges}
@@ -2015,27 +2135,35 @@ def validate_increased_result(
             if end_info.cap_face.material_index != plan.cap_material_indices[index]:
                 raise RuntimeError("Increase changed an end-cap material")
 
-    delta = plan.target_segments - plan.current_segments
-    expected = (
-        before[0] + delta * len(levels),
-        before[1] + delta * (2 * len(levels) - 1),
-        before[2] + delta * (len(levels) - 1),
+    cap_count = sum(
+        end_type is TubeEndType.NGON_CAP for end_type in plan.end_types
     )
-    after = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
-    if after != expected:
+    expected_new = (
+        plan.target_segments * len(levels),
+        plan.target_segments * (2 * len(levels) - 1),
+        plan.target_segments * (len(levels) - 1) + cap_count,
+    )
+    if (len(new_vertices), len(new_edges), len(new_faces)) != expected_new:
         raise RuntimeError("Increase produced unexpected topology counts")
-    if (
-        sum(vertex.select for vertex in edit_mesh.verts)
-        != plan.target_segments * len(levels)
+    staged_counts = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
+    if staged_counts != tuple(
+        original + created for original, created in zip(before, expected_new)
     ):
-        raise RuntimeError("Increase left an invalid vertex selection")
+        raise RuntimeError("Increase staging changed existing topology")
+
+    longitudinal_edges = tuple(
+        _find_connecting_edge(first, second)
+        for chain in chains
+        for first, second in zip(chain, chain[1:])
+    )
+    staged_analysis = analyze_selected_chains(
+        longitudinal_edges, plan.target_segments
+    )
     if (
-        sum(edge.select for edge in edit_mesh.edges)
-        != plan.target_segments * (len(levels) - 1)
+        not staged_analysis.compatible
+        or staged_analysis.current_segments != plan.target_segments
     ):
-        raise RuntimeError("Increase left an invalid edge selection")
-    if any(face.select for face in edit_mesh.faces):
-        raise RuntimeError("Increase selected faces unexpectedly")
+        raise RuntimeError("Increase result cannot be reanalyzed at the target count")
 
 
 def increase_tube_segments(
@@ -2047,6 +2175,23 @@ def increase_tube_segments(
     """Rebuild only the selected tube band at a larger radial resolution."""
     before = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
     new_chains = _create_increased_geometry(edit_mesh, plan)
+    try:
+        edit_mesh.normal_update()
+        validate_increased_result(edit_mesh, plan, new_chains, before)
+    except Exception:
+        new_vertices = tuple(
+            vertex
+            for chain in new_chains
+            for vertex in chain
+            if vertex.is_valid
+        )
+        if new_vertices:
+            bmesh.ops.delete(edit_mesh, geom=new_vertices, context="VERTS")
+        edit_mesh.verts.ensure_lookup_table()
+        edit_mesh.edges.ensure_lookup_table()
+        edit_mesh.faces.ensure_lookup_table()
+        raise
+
     old_vertices = tuple(vertex for level in plan.levels for vertex in level)
     bmesh.ops.delete(edit_mesh, geom=old_vertices, context="VERTS")
     edit_mesh.verts.ensure_lookup_table()
@@ -2054,7 +2199,6 @@ def increase_tube_segments(
     edit_mesh.faces.ensure_lookup_table()
     select_curved_survivors(edit_mesh, new_chains)
     edit_mesh.normal_update()
-    validate_increased_result(edit_mesh, plan, new_chains, before)
     after = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
     geometry_label = "curved tube" if curved else "segments"
     return RadialIncreaseResult(
@@ -3571,6 +3715,1430 @@ def resample_profile_regions(
             f"{plan.target_segments} samples each | Levels: {level_count}"
         ),
         region_count=len(plan.analysis.regions),
+        vertex_count_before=before[0],
+        vertex_count_after=after[0],
+        edge_count_before=before[1],
+        edge_count_after=after[1],
+        face_count_before=before[2],
+        face_count_after=after[2],
+    )
+
+
+def _orient_and_order_longitudinal_chains(
+    components: Sequence[Sequence[Any]],
+) -> tuple[LongitudinalSectionType, tuple[tuple[Any, ...], ...]]:
+    """Orient selected rails and order them through transverse connectivity."""
+    raw_chains = []
+    for component in components:
+        component_edges = set(component)
+        vertices = {vertex for edge in component for vertex in edge.verts}
+        endpoints = [
+            vertex
+            for vertex in vertices
+            if sum(1 for edge in vertex.link_edges if edge in component_edges) == 1
+        ]
+        if len(endpoints) != 2:
+            raise ValueError("Each longitudinal component must be an open chain")
+        raw_chains.append(_walk_open_chain(component, endpoints[0]))
+
+    level_count = len(raw_chains[0])
+    adjacency: list[list[tuple[int, bool]]] = [
+        [] for _ in range(len(raw_chains))
+    ]
+    for first_index, first_chain in enumerate(raw_chains):
+        for second_index in range(first_index + 1, len(raw_chains)):
+            second_chain = raw_chains[second_index]
+            same_count = sum(
+                _find_connecting_edge(first_chain[level], second_chain[level])
+                is not None
+                for level in range(level_count)
+            )
+            reversed_count = sum(
+                _find_connecting_edge(
+                    first_chain[level],
+                    second_chain[level_count - 1 - level],
+                )
+                is not None
+                for level in range(level_count)
+            )
+            if same_count == level_count and reversed_count < level_count:
+                is_reversed = False
+            elif reversed_count == level_count and same_count < level_count:
+                is_reversed = True
+            elif same_count == 0 and reversed_count == 0:
+                continue
+            else:
+                raise ValueError(
+                    "Longitudinal correspondence is inconsistent between levels"
+                )
+            adjacency[first_index].append((second_index, is_reversed))
+            adjacency[second_index].append((first_index, is_reversed))
+
+    degrees = tuple(len(neighbors) for neighbors in adjacency)
+    if len(raw_chains) >= 3 and all(degree == 2 for degree in degrees):
+        section_type = LongitudinalSectionType.CLOSED
+        start_index = 0
+    elif (
+        len(raw_chains) >= 2
+        and degrees.count(1) == 2
+        and all(degree in {1, 2} for degree in degrees)
+    ):
+        section_type = LongitudinalSectionType.OPEN
+        start_index = degrees.index(1)
+    else:
+        raise ValueError(
+            "Selection is not one complete open or closed cross-section band"
+        )
+
+    orientation = {start_index: False}
+    pending = [start_index]
+    while pending:
+        current = pending.pop()
+        for neighbor, reverses_orientation in adjacency[current]:
+            expected = orientation[current] ^ reverses_orientation
+            if neighbor in orientation:
+                if orientation[neighbor] != expected:
+                    raise ValueError("Longitudinal chain orientation is inconsistent")
+                continue
+            orientation[neighbor] = expected
+            pending.append(neighbor)
+    if len(orientation) != len(raw_chains):
+        raise ValueError("Selection contains multiple longitudinal bands")
+
+    order = [start_index]
+    previous = None
+    current = start_index
+    while True:
+        candidates = [
+            neighbor for neighbor, _ in adjacency[current] if neighbor != previous
+        ]
+        if not candidates:
+            break
+        next_index = candidates[0]
+        if section_type is LongitudinalSectionType.CLOSED and next_index == order[0]:
+            break
+        if next_index in order:
+            raise ValueError("Transverse chain order crosses or repeats")
+        order.append(next_index)
+        previous, current = current, next_index
+    if len(order) != len(raw_chains):
+        raise ValueError("Transverse chain order is incomplete")
+
+    return section_type, tuple(
+        tuple(reversed(raw_chains[index]))
+        if orientation[index]
+        else tuple(raw_chains[index])
+        for index in order
+    )
+
+
+def _longitudinal_transverse_pairs(
+    chain_count: int,
+    section_type: LongitudinalSectionType,
+) -> tuple[tuple[int, int], ...]:
+    """Return adjacent sample pairs for an open path or closed cycle."""
+    interval_count = (
+        chain_count
+        if section_type is LongitudinalSectionType.CLOSED
+        else chain_count - 1
+    )
+    return tuple(
+        (index, (index + 1) % chain_count) for index in range(interval_count)
+    )
+
+
+def _collect_longitudinal_band_faces(
+    chains: Sequence[Sequence[Any]],
+    section_type: LongitudinalSectionType,
+) -> tuple[tuple[Any, ...], ...]:
+    """Resolve the unique regular quad strip between every adjacent rail."""
+    rows = []
+    for first_index, second_index in _longitudinal_transverse_pairs(
+        len(chains), section_type
+    ):
+        first_chain = chains[first_index]
+        second_chain = chains[second_index]
+        row = []
+        for level_index in range(len(first_chain) - 1):
+            face = _find_lateral_face(
+                first_chain[level_index],
+                first_chain[level_index + 1],
+                second_chain[level_index],
+                second_chain[level_index + 1],
+            )
+            if face is None or len(face.verts) != 4:
+                raise ValueError("Longitudinal resampling requires a regular quad band")
+            if face.calc_area() <= _GEOMETRY_EPSILON:
+                raise ValueError("Longitudinal band contains a degenerate quad")
+            row.append(face)
+        rows.append(tuple(row))
+    faces = tuple(face for row in rows for face in row)
+    if len(set(faces)) != len(faces):
+        raise ValueError("Longitudinal faces are duplicated or shared unexpectedly")
+    return tuple(rows)
+
+
+def _validate_longitudinal_level_positions(
+    positions: Sequence[Vector],
+    section_type: LongitudinalSectionType,
+) -> None:
+    """Reject collapsed or degenerate transverse cross-sections."""
+    if len({tuple(position) for position in positions}) != len(positions):
+        raise ValueError("A longitudinal level contains duplicate samples")
+    pairs = _longitudinal_transverse_pairs(len(positions), section_type)
+    if any(
+        (positions[second] - positions[first]).length <= _GEOMETRY_EPSILON
+        for first, second in pairs
+    ):
+        raise ValueError("A longitudinal level contains a zero-length edge")
+    if section_type is LongitudinalSectionType.CLOSED:
+        area_vector = Vector((0.0, 0.0, 0.0))
+        for first, second in pairs:
+            area_vector += positions[first].cross(positions[second])
+        if area_vector.length <= _GEOMETRY_EPSILON:
+            raise ValueError("A longitudinal level has a degenerate cross-section")
+
+
+def _longitudinal_base_edges(
+    levels: Sequence[Sequence[Any]],
+    section_type: LongitudinalSectionType,
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Resolve the exact transverse BMesh edges that define both bases."""
+    result = []
+    for level in (levels[0], levels[-1]):
+        edges = tuple(
+            _find_connecting_edge(level[first], level[second])
+            for first, second in _longitudinal_transverse_pairs(
+                len(level), section_type
+            )
+        )
+        if any(edge is None for edge in edges):
+            raise ValueError("A terminal base is missing a transverse edge")
+        result.append(edges)
+    return tuple(result)
+
+
+def _validate_longitudinal_correspondence(
+    levels: Sequence[Sequence[Any]],
+    centers: Sequence[Vector],
+) -> None:
+    """Reject rails whose corresponding samples flip across the bend axis."""
+    for level_index in range(len(levels) - 1):
+        for first_vertex, second_vertex in zip(
+            levels[level_index], levels[level_index + 1]
+        ):
+            first = first_vertex.co - centers[level_index]
+            second = second_vertex.co - centers[level_index + 1]
+            if (
+                first.length <= _GEOMETRY_EPSILON
+                or second.length <= _GEOMETRY_EPSILON
+            ):
+                continue
+            if first.normalized().dot(second.normalized()) < 0.0:
+                raise ValueError(
+                    "Longitudinal correspondence contains an excessive twist"
+                )
+
+
+def _validate_longitudinal_external_geometry(
+    levels: Sequence[Sequence[Any]],
+    band_faces: Sequence[Sequence[Any]],
+) -> tuple[Any, ...]:
+    """Allow arbitrary attachments at bases but reject all interior attachments."""
+    allowed_faces = {face for row in band_faces for face in row}
+    band_vertices = {vertex for level in levels for vertex in level}
+    base_vertices = set(levels[0]) | set(levels[-1])
+    external = set()
+    for vertex in band_vertices:
+        for face in vertex.link_faces:
+            if face in allowed_faces:
+                continue
+            if vertex not in base_vertices:
+                raise ValueError(
+                    "External geometry is attached to an interior longitudinal level"
+                )
+            external.add(face)
+            external.update(face.edges)
+            external.update(face.verts)
+        for edge in vertex.link_edges:
+            other = edge.other_vert(vertex)
+            if other in band_vertices:
+                continue
+            if vertex not in base_vertices:
+                raise ValueError(
+                    "External geometry is attached to an interior longitudinal level"
+                )
+            external.add(edge)
+            external.add(other)
+    return tuple(external)
+
+
+def _longitudinal_analysis_result(
+    valid: bool,
+    status: str,
+    *,
+    selection_kind: LongitudinalSelectionKind | None = None,
+    section_type: LongitudinalSectionType | None = None,
+    ordered_chains: tuple[tuple[Any, ...], ...] = (),
+    levels: tuple[tuple[Any, ...], ...] = (),
+    band_faces: tuple[tuple[Any, ...], ...] = (),
+    centers: tuple[Vector, ...] = (),
+    cumulative_lengths: tuple[float, ...] = (),
+    path_length: float = 0.0,
+    base_edges: tuple[tuple[Any, ...], tuple[Any, ...]] = ((), ()),
+    external_elements: tuple[Any, ...] = (),
+) -> LongitudinalAnalysis:
+    """Build one analysis result without duplicating default state."""
+    return LongitudinalAnalysis(
+        valid=valid,
+        status=status,
+        selection_kind=selection_kind,
+        section_type=section_type,
+        ordered_chains=ordered_chains,
+        levels=levels,
+        band_faces=band_faces,
+        centers=centers,
+        cumulative_lengths=cumulative_lengths,
+        path_length=path_length,
+        base_edges=base_edges,
+        external_elements=external_elements,
+    )
+
+
+def _analyze_longitudinal_common(
+    ordered_chains: Sequence[Sequence[Any]],
+    section_type: LongitudinalSectionType,
+    selection_kind: LongitudinalSelectionKind,
+) -> LongitudinalAnalysis:
+    """Run the shared bend analysis after either input has reconstructed rails."""
+    try:
+        ordered_chains = tuple(tuple(chain) for chain in ordered_chains)
+        levels = build_longitudinal_levels(ordered_chains)
+        if len(levels) < 3:
+            raise ValueError(
+                "Longitudinal v1 requires at least one interior cut between bases"
+            )
+        for level in levels:
+            _validate_longitudinal_level_positions(
+                tuple(vertex.co for vertex in level), section_type
+            )
+        band_faces = _collect_longitudinal_band_faces(
+            ordered_chains, section_type
+        )
+        centers = calculate_level_centers(levels)
+        _validate_longitudinal_correspondence(levels, centers)
+        cumulative = [0.0]
+        for first, second in zip(centers, centers[1:]):
+            length = (second - first).length
+            if length <= _GEOMETRY_EPSILON:
+                raise ValueError(
+                    "Longitudinal centerline contains a zero-length segment"
+                )
+            cumulative.append(cumulative[-1] + length)
+        base_edges = _longitudinal_base_edges(levels, section_type)
+        external = _validate_longitudinal_external_geometry(levels, band_faces)
+        return _longitudinal_analysis_result(
+            True,
+            f"Compatible {section_type.value.lower()} longitudinal bend",
+            selection_kind=selection_kind,
+            section_type=section_type,
+            ordered_chains=ordered_chains,
+            levels=levels,
+            band_faces=band_faces,
+            centers=centers,
+            cumulative_lengths=tuple(cumulative),
+            path_length=cumulative[-1],
+            base_edges=base_edges,
+            external_elements=external,
+        )
+    except ValueError as error:
+        return _longitudinal_analysis_result(
+            False,
+            str(error),
+            selection_kind=selection_kind,
+            section_type=section_type,
+        )
+
+
+def _analyze_longitudinal_rails(
+    selected_edges: Sequence[Any],
+) -> LongitudinalAnalysis:
+    """Recognize the original complete-rail input contract."""
+    if not selected_edges:
+        return _longitudinal_analysis_result(
+            False, "No selected longitudinal chains"
+        )
+    components = separate_connected_edge_components(selected_edges)
+    component_info = tuple(classify_edge_component(item) for item in components)
+    if any(item.is_branched for item in component_info):
+        return _longitudinal_analysis_result(
+            False, "Selection contains branched longitudinal chains"
+        )
+    if any(item.is_closed for item in component_info):
+        return _longitudinal_analysis_result(
+            False, "Selected rails form closed paths"
+        )
+    if any(not item.is_open_chain for item in component_info):
+        return _longitudinal_analysis_result(
+            False, "Selection contains invalid longitudinal rails"
+        )
+    edge_counts = {item.edge_count for item in component_info}
+    vertex_counts = {item.vertex_count for item in component_info}
+    if len(edge_counts) != 1 or len(vertex_counts) != 1:
+        return _longitudinal_analysis_result(
+            False, "Selected longitudinal rails have different levels"
+        )
+    try:
+        section_type, ordered_chains = _orient_and_order_longitudinal_chains(
+            components
+        )
+    except ValueError as error:
+        return _longitudinal_analysis_result(False, str(error))
+    return _analyze_longitudinal_common(
+        ordered_chains,
+        section_type,
+        LongitudinalSelectionKind.RAILS,
+    )
+
+
+def _ordered_cross_loop_vertices(
+    component: Sequence[Any],
+    section_type: LongitudinalSectionType,
+) -> tuple[Any, ...]:
+    """Walk one selected transverse path or cycle without using indices."""
+    component_edges = set(component)
+    vertices = {vertex for edge in component for vertex in edge.verts}
+    if section_type is LongitudinalSectionType.OPEN:
+        endpoints = [
+            vertex
+            for vertex in vertices
+            if sum(1 for edge in vertex.link_edges if edge in component_edges) == 1
+        ]
+        if len(endpoints) != 2:
+            raise ValueError("Selected cross-loop is incomplete")
+        return _walk_open_chain(component, endpoints[0])
+
+    if not vertices:
+        raise ValueError("Selected cross-loop is empty")
+    adjacency = {
+        vertex: tuple(
+            edge.other_vert(vertex)
+            for edge in vertex.link_edges
+            if edge in component_edges
+        )
+        for vertex in vertices
+    }
+    if any(len(neighbors) != 2 for neighbors in adjacency.values()):
+        raise ValueError("Selected closed cross-loop is incomplete")
+    start = next(iter(vertices))
+    ordered = [start]
+    previous = None
+    current = start
+    while True:
+        candidates = [item for item in adjacency[current] if item is not previous]
+        following = candidates[0]
+        if following is start:
+            break
+        if following in ordered:
+            raise ValueError("Selected cross-loop crosses or repeats")
+        ordered.append(following)
+        previous, current = current, following
+    if len(ordered) != len(vertices):
+        raise ValueError("Selected closed cross-loop is incomplete")
+    return tuple(ordered)
+
+
+def _cross_level_pair_is_regular(
+    first_level: Sequence[Any],
+    second_level: Sequence[Any],
+    section_type: LongitudinalSectionType,
+) -> bool:
+    """Return whether two aligned levels form one complete quad interval."""
+    if len(first_level) != len(second_level):
+        return False
+    for first, second in _longitudinal_transverse_pairs(
+        len(first_level), section_type
+    ):
+        if _find_connecting_edge(second_level[first], second_level[second]) is None:
+            return False
+        face = _find_lateral_face(
+            first_level[first],
+            first_level[second],
+            second_level[first],
+            second_level[second],
+        )
+        if face is None or len(face.verts) != 4:
+            return False
+    return True
+
+
+def _align_cross_loop_to_level(
+    source_level: Sequence[Any],
+    candidate_vertices: set[Any],
+    section_type: LongitudinalSectionType,
+) -> tuple[Any, ...] | None:
+    """Align a known neighboring loop through longitudinal mesh edges."""
+    aligned = []
+    for source in source_level:
+        matches = tuple(
+            edge.other_vert(source)
+            for edge in source.link_edges
+            if edge.other_vert(source) in candidate_vertices
+        )
+        if len(matches) != 1:
+            return None
+        aligned.append(matches[0])
+    if len(set(aligned)) != len(source_level) or set(aligned) != candidate_vertices:
+        return None
+    aligned = tuple(aligned)
+    if not _cross_level_pair_is_regular(
+        source_level, aligned, section_type
+    ):
+        return None
+    return aligned
+
+
+def _neighbor_cross_levels(
+    source_level: Sequence[Any],
+    section_type: LongitudinalSectionType,
+) -> tuple[tuple[Any, ...], ...]:
+    """Enumerate complete transverse levels directly adjacent to one level."""
+    source_set = set(source_level)
+    options = tuple(
+        tuple(
+            edge.other_vert(source)
+            for edge in source.link_edges
+            if edge.other_vert(source) not in source_set
+        )
+        for source in source_level
+    )
+    candidates: list[tuple[Any, ...]] = []
+
+    def extend(path: list[Any], source_index: int) -> None:
+        if source_index == len(source_level):
+            candidate = tuple(path)
+            if _cross_level_pair_is_regular(
+                source_level, candidate, section_type
+            ):
+                candidates.append(candidate)
+            return
+        for vertex in options[source_index]:
+            if vertex in path:
+                continue
+            if _find_connecting_edge(path[-1], vertex) is None:
+                continue
+            if (
+                section_type is LongitudinalSectionType.CLOSED
+                and source_index == len(source_level) - 1
+                and _find_connecting_edge(vertex, path[0]) is None
+            ):
+                continue
+            path.append(vertex)
+            extend(path, source_index + 1)
+            path.pop()
+
+    for first in options[0]:
+        extend([first], 1)
+    unique = {}
+    for candidate in candidates:
+        unique.setdefault(frozenset(candidate), candidate)
+    return tuple(unique.values())
+
+
+def _selected_components_share_mesh_island(
+    components: Sequence[Sequence[Any]],
+) -> bool:
+    """Distinguish disconnected bands from gaps inside one mesh island."""
+    selected_vertices = {
+        vertex for component in components for edge in component for vertex in edge.verts
+    }
+    if not selected_vertices:
+        return False
+    pending = [next(iter(selected_vertices))]
+    visited = set(pending)
+    while pending:
+        vertex = pending.pop()
+        for edge in vertex.link_edges:
+            other = edge.other_vert(vertex)
+            if other not in visited:
+                visited.add(other)
+                pending.append(other)
+    return selected_vertices <= visited
+
+
+def _open_cross_loop_has_unselected_closure(
+    level: Sequence[Any],
+    selected_edges: set[Any],
+    region_vertices: set[Any],
+) -> bool:
+    """Detect a partial selection cut from an otherwise closed cross-section."""
+    start, end = level[0], level[-1]
+    pending = [start]
+    visited = {start}
+    while pending:
+        vertex = pending.pop()
+        for edge in vertex.link_edges:
+            if edge in selected_edges:
+                continue
+            other = edge.other_vert(vertex)
+            if other is end:
+                return True
+            if other in region_vertices or other in visited:
+                continue
+            visited.add(other)
+            pending.append(other)
+    return False
+
+
+def _analyze_longitudinal_cross_loops(
+    selected_edges: Sequence[Any],
+) -> LongitudinalAnalysis:
+    """Reconstruct bases and rails from consecutive selected cross-loops."""
+    if not selected_edges:
+        return _longitudinal_analysis_result(False, "No selected cross-loops")
+    components = separate_connected_edge_components(selected_edges)
+    component_info = tuple(classify_edge_component(item) for item in components)
+    if any(item.is_branched for item in component_info):
+        return _longitudinal_analysis_result(
+            False, "Selected cross-loop is branched or incomplete"
+        )
+    if all(item.is_closed for item in component_info):
+        section_type = LongitudinalSectionType.CLOSED
+    elif all(item.is_open_chain for item in component_info):
+        section_type = LongitudinalSectionType.OPEN
+    else:
+        return _longitudinal_analysis_result(
+            False, "Selected cross-loop is incomplete or incompatible"
+        )
+    vertex_counts = {item.vertex_count for item in component_info}
+    if len(vertex_counts) != 1:
+        return _longitudinal_analysis_result(
+            False, "Selected cross-loops have different sample counts"
+        )
+    sample_count = next(iter(vertex_counts))
+    if (
+        section_type is LongitudinalSectionType.CLOSED and sample_count < 3
+    ) or (
+        section_type is LongitudinalSectionType.OPEN and sample_count < 2
+    ):
+        return _longitudinal_analysis_result(
+            False, "Selected cross-loop has too few samples"
+        )
+
+    try:
+        raw_levels = tuple(
+            _ordered_cross_loop_vertices(component, section_type)
+            for component in components
+        )
+    except ValueError as error:
+        return _longitudinal_analysis_result(False, str(error))
+    component_sets = tuple(
+        {vertex for edge in component for vertex in edge.verts}
+        for component in components
+    )
+    adjacency: list[list[int]] = [[] for _ in components]
+    for first_index, first_level in enumerate(raw_levels):
+        for second_index in range(first_index + 1, len(raw_levels)):
+            if _align_cross_loop_to_level(
+                first_level,
+                component_sets[second_index],
+                section_type,
+            ) is None:
+                continue
+            adjacency[first_index].append(second_index)
+            adjacency[second_index].append(first_index)
+
+    degrees = tuple(len(neighbors) for neighbors in adjacency)
+    if len(components) > 1 and all(degree == 2 for degree in degrees):
+        pending = [0]
+        visited = {0}
+        while pending:
+            current = pending.pop()
+            for neighbor in adjacency[current]:
+                if neighbor not in visited:
+                    visited.add(neighbor)
+                    pending.append(neighbor)
+        if len(visited) == len(components):
+            return _longitudinal_analysis_result(
+                False, "Closed longitudinal paths are not supported yet"
+            )
+    valid_path = (
+        len(components) == 1
+        or (
+            degrees.count(1) == 2
+            and all(degree in {1, 2} for degree in degrees)
+        )
+    )
+    if not valid_path:
+        if not _selected_components_share_mesh_island(components):
+            status = "Selected cross-loops belong to multiple bands"
+        else:
+            status = (
+                "Selected cross-loops must form one consecutive longitudinal region"
+            )
+        return _longitudinal_analysis_result(False, status)
+
+    if len(components) == 1:
+        ordered_indices = [0]
+        selected_levels = [raw_levels[0]]
+    else:
+        start_index = degrees.index(1)
+        ordered_indices = [start_index]
+        selected_levels = [raw_levels[start_index]]
+        previous = None
+        current = start_index
+        while True:
+            following = [item for item in adjacency[current] if item != previous]
+            if not following:
+                break
+            next_index = following[0]
+            aligned = _align_cross_loop_to_level(
+                selected_levels[-1], component_sets[next_index], section_type
+            )
+            if aligned is None:
+                return _longitudinal_analysis_result(
+                    False, "Cross-loop correspondence is incomplete"
+                )
+            ordered_indices.append(next_index)
+            selected_levels.append(aligned)
+            previous, current = current, next_index
+        if len(ordered_indices) != len(components):
+            return _longitudinal_analysis_result(
+                False,
+                "Selected cross-loops must form one consecutive longitudinal region",
+            )
+
+    selected_sets = tuple(component_sets[index] for index in ordered_indices)
+
+    def external_candidates(level: Sequence[Any]) -> tuple[tuple[Any, ...], ...]:
+        return tuple(
+            candidate
+            for candidate in _neighbor_cross_levels(level, section_type)
+            if all(set(candidate) != selected_set for selected_set in selected_sets)
+        )
+
+    if len(selected_levels) == 1:
+        candidates = external_candidates(selected_levels[0])
+        if len(candidates) > 2:
+            return _longitudinal_analysis_result(
+                False, "Base detection is ambiguous around the selected cross-loop"
+            )
+        if len(candidates) < 2:
+            return _longitudinal_analysis_result(
+                False, "Could not detect one complete Base A and Base B"
+            )
+        base_a, base_b = candidates
+    else:
+        first_candidates = external_candidates(selected_levels[0])
+        last_candidates = external_candidates(selected_levels[-1])
+        if len(first_candidates) > 1 or len(last_candidates) > 1:
+            return _longitudinal_analysis_result(
+                False, "Base detection is ambiguous at a selected region endpoint"
+            )
+        if len(first_candidates) != 1 or len(last_candidates) != 1:
+            return _longitudinal_analysis_result(
+                False, "Could not detect exactly one complete base at each end"
+            )
+        base_a, base_b = first_candidates[0], last_candidates[0]
+    if set(base_a) == set(base_b) or set(base_a) & set(base_b):
+        return _longitudinal_analysis_result(
+            False, "Base A and Base B are not distinct"
+        )
+
+    levels = (tuple(base_a), *tuple(selected_levels), tuple(base_b))
+    region_vertices = {vertex for level in levels for vertex in level}
+    if section_type is LongitudinalSectionType.OPEN and any(
+        _open_cross_loop_has_unselected_closure(
+            level, set(selected_edges), region_vertices
+        )
+        for level in selected_levels
+    ):
+        return _longitudinal_analysis_result(
+            False, "Selected cross-loop is incomplete"
+        )
+    ordered_chains = tuple(
+        tuple(level[sample] for level in levels)
+        for sample in range(sample_count)
+    )
+    return _analyze_longitudinal_common(
+        ordered_chains,
+        section_type,
+        LongitudinalSelectionKind.CROSS_LOOPS,
+    )
+
+
+def analyze_longitudinal_bend(
+    selected_edges: Iterable[Any],
+) -> LongitudinalAnalysis:
+    """Auto-detect rails or cross-loops and converge on shared bend analysis."""
+    selected_edges = tuple(selected_edges)
+    rails = _analyze_longitudinal_rails(selected_edges)
+    cross_loops = _analyze_longitudinal_cross_loops(selected_edges)
+    if rails.valid and cross_loops.valid:
+        return _longitudinal_analysis_result(
+            False,
+            "Selection is ambiguous between Rails and Cross Loops",
+        )
+    if rails.valid:
+        return rails
+    if cross_loops.valid:
+        return cross_loops
+    if not selected_edges:
+        return rails
+    if cross_loops.selection_kind is LongitudinalSelectionKind.CROSS_LOOPS:
+        return cross_loops
+    if rails.selection_kind is LongitudinalSelectionKind.RAILS:
+        return rails
+    return cross_loops
+
+
+def _longitudinal_source_at_distance(
+    cumulative: Sequence[float],
+    distance: float,
+) -> tuple[int, float]:
+    """Locate one source centerline segment and its interpolation fraction."""
+    distance = max(0.0, min(distance, cumulative[-1]))
+    for index in range(len(cumulative) - 1):
+        if distance <= cumulative[index + 1] or index == len(cumulative) - 2:
+            span = cumulative[index + 1] - cumulative[index]
+            return index, (distance - cumulative[index]) / span
+    raise ValueError("Could not locate a longitudinal sample")
+
+
+def _centripetal_catmull_rom_point(
+    control_a: Vector,
+    start: Vector,
+    end: Vector,
+    control_b: Vector,
+    fraction: float,
+) -> Vector:
+    """Evaluate one centripetal Catmull-Rom segment with local controls."""
+    parameters = [0.0]
+    for first, second in zip(
+        (control_a, start, end),
+        (start, end, control_b),
+    ):
+        distance = (second - first).length
+        if distance <= _GEOMETRY_EPSILON:
+            raise ValueError("Smooth centerline has coincident control points")
+        parameters.append(parameters[-1] + math.sqrt(distance))
+    first_time, start_time, end_time, last_time = parameters
+    sample_time = start_time + fraction * (end_time - start_time)
+
+    def interpolate(
+        first: Vector,
+        second: Vector,
+        first_parameter: float,
+        second_parameter: float,
+    ) -> Vector:
+        span = second_parameter - first_parameter
+        if span <= _GEOMETRY_EPSILON:
+            raise ValueError("Smooth centerline has an invalid parameter span")
+        return (
+            first * ((second_parameter - sample_time) / span)
+            + second * ((sample_time - first_parameter) / span)
+        )
+
+    first_a = interpolate(control_a, start, first_time, start_time)
+    second_a = interpolate(start, end, start_time, end_time)
+    third_a = interpolate(end, control_b, end_time, last_time)
+    first_b = (
+        first_a * ((end_time - sample_time) / (end_time - first_time))
+        + second_a * ((sample_time - first_time) / (end_time - first_time))
+    )
+    second_b = (
+        second_a * ((last_time - sample_time) / (last_time - start_time))
+        + third_a * ((sample_time - start_time) / (last_time - start_time))
+    )
+    return (
+        first_b * ((end_time - sample_time) / (end_time - start_time))
+        + second_b * ((sample_time - start_time) / (end_time - start_time))
+    )
+
+
+def _build_smooth_longitudinal_centers(
+    centers: Sequence[Vector],
+    target_level_count: int,
+) -> tuple[tuple[Vector, ...], float]:
+    """Build and arc-length sample one conservative smooth centerline."""
+    segment_count = len(centers) - 1
+    samples_per_segment = max(
+        24,
+        min(
+            128,
+            math.ceil((target_level_count - 1) / segment_count) * 4,
+        ),
+    )
+    dense_points = [centers[0].copy()]
+    for index, (start, end) in enumerate(zip(centers, centers[1:])):
+        control_a = (
+            centers[index - 1]
+            if index > 0
+            else start + (start - end)
+        )
+        control_b = (
+            centers[index + 2]
+            if index + 2 < len(centers)
+            else end + (end - start)
+        )
+        for sample_index in range(1, samples_per_segment + 1):
+            point = _centripetal_catmull_rom_point(
+                control_a,
+                start,
+                end,
+                control_b,
+                sample_index / samples_per_segment,
+            )
+            if not all(math.isfinite(component) for component in point):
+                raise ValueError("Smooth centerline contains NaN or Inf")
+            if (point - dense_points[-1]).length <= _GEOMETRY_EPSILON:
+                raise ValueError("Smooth centerline contains a degenerate segment")
+            dense_points.append(point)
+
+    cumulative = [0.0]
+    for first, second in zip(dense_points, dense_points[1:]):
+        cumulative.append(cumulative[-1] + (second - first).length)
+    path_length = cumulative[-1]
+    if not math.isfinite(path_length) or path_length <= _GEOMETRY_EPSILON:
+        raise ValueError("Smooth centerline has an invalid arc length")
+
+    target_centers = []
+    for level_index in range(target_level_count):
+        if level_index == 0:
+            target_centers.append(centers[0].copy())
+            continue
+        if level_index == target_level_count - 1:
+            target_centers.append(centers[-1].copy())
+            continue
+        distance = level_index * path_length / (target_level_count - 1)
+        source_index, blend = _longitudinal_source_at_distance(
+            cumulative, distance
+        )
+        target_centers.append(
+            dense_points[source_index].lerp(
+                dense_points[source_index + 1], blend
+            )
+        )
+    if len({tuple(center) for center in target_centers}) != len(target_centers):
+        raise ValueError("Smooth centerline self-collapses at a target level")
+    if any(
+        (second - first).length <= _GEOMETRY_EPSILON
+        for first, second in zip(target_centers, target_centers[1:])
+    ):
+        raise ValueError("Smooth centerline contains a degenerate target segment")
+    return tuple(target_centers), path_length
+
+
+def _build_smooth_longitudinal_positions(
+    analysis: LongitudinalAnalysis,
+    final_level_count: int,
+) -> tuple[
+    tuple[tuple[Vector, ...], ...],
+    tuple[tuple[int, float], ...],
+    tuple[Vector, ...],
+    float,
+]:
+    """Place interpolated source sections on one shared smooth centerline."""
+    target_centers, target_path_length = _build_smooth_longitudinal_centers(
+        analysis.centers, final_level_count
+    )
+    source_tangents = calculate_local_tangents(analysis.centers)
+    target_tangents = calculate_local_tangents(target_centers)
+    if any(
+        first.dot(second) <= _FRAME_FLIP_DOT_THRESHOLD
+        for first, second in zip(target_tangents, target_tangents[1:])
+    ):
+        raise ValueError("Smooth centerline contains an extreme tangent flip")
+
+    positions = []
+    position_sources = []
+    for level_index in range(final_level_count):
+        fraction = level_index / (final_level_count - 1)
+        source_index, blend = _longitudinal_source_at_distance(
+            analysis.cumulative_lengths, fraction * analysis.path_length
+        )
+        if level_index == 0:
+            source_index, blend = 0, 0.0
+            level_positions = tuple(
+                vertex.co.copy() for vertex in analysis.levels[0]
+            )
+        elif level_index == final_level_count - 1:
+            source_index, blend = len(analysis.levels) - 2, 1.0
+            level_positions = tuple(
+                vertex.co.copy() for vertex in analysis.levels[-1]
+            )
+        else:
+            source_center = analysis.centers[source_index].lerp(
+                analysis.centers[source_index + 1], blend
+            )
+            source_tangent = source_tangents[source_index].lerp(
+                source_tangents[source_index + 1], blend
+            )
+            if source_tangent.length <= _GEOMETRY_EPSILON:
+                raise ValueError("Smooth source frame has an invalid tangent")
+            source_tangent.normalize()
+            target_tangent = target_tangents[level_index]
+            if source_tangent.dot(target_tangent) <= _FRAME_FLIP_DOT_THRESHOLD:
+                raise ValueError("Smooth path would create an extreme frame flip")
+            rotation = source_tangent.rotation_difference(target_tangent)
+            level_positions = tuple(
+                target_centers[level_index]
+                + rotation
+                @ (
+                    analysis.levels[source_index][chain_index].co.lerp(
+                        analysis.levels[source_index + 1][chain_index].co,
+                        blend,
+                    )
+                    - source_center
+                )
+                for chain_index in range(len(analysis.ordered_chains))
+            )
+        if not all(
+            math.isfinite(component)
+            for position in level_positions
+            for component in position
+        ):
+            raise ValueError("Smooth longitudinal positions contain NaN or Inf")
+        _validate_longitudinal_level_positions(
+            level_positions, analysis.section_type
+        )
+        position_sources.append((source_index, blend))
+        positions.append(level_positions)
+
+    for first_level, second_level, first_center, second_center in zip(
+        positions,
+        positions[1:],
+        target_centers,
+        target_centers[1:],
+    ):
+        for first, second in zip(first_level, second_level):
+            first_offset = first - first_center
+            second_offset = second - second_center
+            if (
+                first_offset.length > _GEOMETRY_EPSILON
+                and second_offset.length > _GEOMETRY_EPSILON
+                and first_offset.normalized().dot(second_offset.normalized()) < 0.0
+            ):
+                raise ValueError("Smooth path would twist a cross-section")
+            if (second - first).length <= _GEOMETRY_EPSILON:
+                raise ValueError("Smooth path would collapse a longitudinal rail")
+    return (
+        tuple(positions),
+        tuple(position_sources),
+        target_centers,
+        target_path_length,
+    )
+
+
+def build_longitudinal_resample_plan(
+    analysis: LongitudinalAnalysis,
+    target_cuts: int,
+    path_shape: LongitudinalPathShape | str = LongitudinalPathShape.PRESERVE,
+) -> LongitudinalResamplePlan:
+    """Plan every target level and data transfer before touching BMesh."""
+    if not analysis.valid or analysis.section_type is None:
+        raise ValueError(analysis.status)
+    if target_cuts < 1:
+        raise ValueError("Target Cuts must be at least 1 in longitudinal v1")
+    if target_cuts == analysis.current_cuts:
+        raise ValueError("Target Cuts already matches Current Cuts")
+    try:
+        path_shape = LongitudinalPathShape(path_shape)
+    except ValueError as error:
+        raise ValueError("Unknown longitudinal Path Shape") from error
+
+    final_level_count = target_cuts + 2
+    if path_shape is LongitudinalPathShape.PRESERVE:
+        position_sources = []
+        positions = []
+        for level_index in range(final_level_count):
+            fraction = level_index / (final_level_count - 1)
+            source_index, blend = _longitudinal_source_at_distance(
+                analysis.cumulative_lengths, fraction * analysis.path_length
+            )
+            if level_index == 0:
+                source_index, blend = 0, 0.0
+            elif level_index == final_level_count - 1:
+                source_index, blend = len(analysis.levels) - 2, 1.0
+            level_positions = tuple(
+                analysis.levels[source_index][chain_index].co.lerp(
+                    analysis.levels[source_index + 1][chain_index].co, blend
+                )
+                for chain_index in range(len(analysis.ordered_chains))
+            )
+            _validate_longitudinal_level_positions(
+                level_positions, analysis.section_type
+            )
+            position_sources.append((source_index, blend))
+            positions.append(level_positions)
+        positions = tuple(positions)
+        position_sources = tuple(position_sources)
+        target_centers = tuple(
+            sum(level, Vector((0.0, 0.0, 0.0))) / len(level)
+            for level in positions
+        )
+        target_path_length = sum(
+            (second - first).length
+            for first, second in zip(target_centers, target_centers[1:])
+        )
+    else:
+        (
+            positions,
+            position_sources,
+            target_centers,
+            target_path_length,
+        ) = _build_smooth_longitudinal_positions(
+            analysis, final_level_count
+        )
+
+    interval_sources = []
+    source_face_normals = []
+    source_face_materials = []
+    transverse_pairs = _longitudinal_transverse_pairs(
+        len(analysis.ordered_chains), analysis.section_type
+    )
+    for interval in range(final_level_count - 1):
+        midpoint_fraction = (interval + 0.5) / (final_level_count - 1)
+        source_index, _ = _longitudinal_source_at_distance(
+            analysis.cumulative_lengths,
+            midpoint_fraction * analysis.path_length,
+        )
+        interval_sources.append(source_index)
+        normals = []
+        materials = []
+        for transverse_index, (first, second) in enumerate(transverse_pairs):
+            a = positions[interval][first]
+            b = positions[interval][second]
+            c = positions[interval + 1][second]
+            d = positions[interval + 1][first]
+            area = (b - a).cross(d - a).length + (c - b).cross(d - b).length
+            if area <= _GEOMETRY_EPSILON:
+                raise ValueError("Longitudinal plan would create a degenerate quad")
+            source_face = analysis.band_faces[transverse_index][source_index]
+            if path_shape is LongitudinalPathShape.SMOOTH:
+                planned_normal = (b - a).cross(d - a) + (c - b).cross(d - b)
+                if (
+                    planned_normal.length <= _GEOMETRY_EPSILON
+                    or abs(planned_normal.normalized().dot(source_face.normal))
+                    <= 1.0e-4
+                ):
+                    raise ValueError(
+                        "Smooth path would create unsafe quad winding"
+                    )
+            normals.append(source_face.normal.copy())
+            materials.append(source_face.material_index)
+        source_face_normals.append(tuple(normals))
+        source_face_materials.append(tuple(materials))
+
+    return LongitudinalResamplePlan(
+        section_type=analysis.section_type,
+        path_shape=path_shape,
+        current_cuts=analysis.current_cuts,
+        target_cuts=target_cuts,
+        ordered_chains=analysis.ordered_chains,
+        levels=analysis.levels,
+        band_faces=analysis.band_faces,
+        centers=analysis.centers,
+        cumulative_lengths=analysis.cumulative_lengths,
+        path_length=analysis.path_length,
+        target_centers=target_centers,
+        target_path_length=target_path_length,
+        positions=positions,
+        position_sources=position_sources,
+        interval_sources=tuple(interval_sources),
+        source_face_normals=tuple(source_face_normals),
+        source_face_materials=tuple(source_face_materials),
+        base_vertices=(analysis.levels[0], analysis.levels[-1]),
+        base_coordinates=(
+            tuple(vertex.co.copy() for vertex in analysis.levels[0]),
+            tuple(vertex.co.copy() for vertex in analysis.levels[-1]),
+        ),
+        base_edges=analysis.base_edges,
+        external_elements=analysis.external_elements,
+    )
+
+
+def _create_longitudinal_geometry(
+    edit_mesh: Any,
+    plan: LongitudinalResamplePlan,
+) -> tuple[tuple[Any, ...], ...]:
+    """Stage a complete new bend while the original interior still exists."""
+    level_count = plan.target_cuts + 2
+    chain_count = len(plan.ordered_chains)
+    new_levels: list[tuple[Any, ...]] = [plan.base_vertices[0]]
+    created_vertices = []
+    try:
+        for level_index in range(1, level_count - 1):
+            source_index, blend = plan.position_sources[level_index]
+            source_level = source_index + (1 if blend > 0.5 else 0)
+            level = []
+            for chain_index in range(chain_count):
+                vertex = edit_mesh.verts.new(
+                    plan.positions[level_index][chain_index]
+                )
+                _copy_custom_data_layers(
+                    vertex,
+                    plan.levels[source_level][chain_index],
+                    edit_mesh.verts.layers,
+                )
+                created_vertices.append(vertex)
+                level.append(vertex)
+            new_levels.append(tuple(level))
+        new_levels.append(plan.base_vertices[1])
+
+        for chain_index in range(chain_count):
+            for level_index in range(level_count - 1):
+                edge = edit_mesh.edges.new(
+                    (
+                        new_levels[level_index][chain_index],
+                        new_levels[level_index + 1][chain_index],
+                    )
+                )
+                source_edge = _find_connecting_edge(
+                    plan.ordered_chains[chain_index][
+                        plan.interval_sources[level_index]
+                    ],
+                    plan.ordered_chains[chain_index][
+                        plan.interval_sources[level_index] + 1
+                    ],
+                )
+                if source_edge is None:
+                    raise RuntimeError("A source longitudinal edge disappeared")
+                _copy_custom_data_layers(
+                    edge, source_edge, edit_mesh.edges.layers
+                )
+
+        transverse_pairs = _longitudinal_transverse_pairs(
+            chain_count, plan.section_type
+        )
+        for level_index in range(1, level_count - 1):
+            source_index, blend = plan.position_sources[level_index]
+            source_level = source_index + (1 if blend > 0.5 else 0)
+            for first, second in transverse_pairs:
+                edge = edit_mesh.edges.new(
+                    (new_levels[level_index][first], new_levels[level_index][second])
+                )
+                source_edge = _find_connecting_edge(
+                    plan.levels[source_level][first],
+                    plan.levels[source_level][second],
+                )
+                if source_edge is None:
+                    raise RuntimeError("A source transverse edge disappeared")
+                _copy_custom_data_layers(
+                    edge, source_edge, edit_mesh.edges.layers
+                )
+
+        for level_index in range(level_count - 1):
+            source_interval = plan.interval_sources[level_index]
+            for transverse_index, (first, second) in enumerate(transverse_pairs):
+                face = edit_mesh.faces.new(
+                    (
+                        new_levels[level_index][first],
+                        new_levels[level_index][second],
+                        new_levels[level_index + 1][second],
+                        new_levels[level_index + 1][first],
+                    )
+                )
+                face.normal_update()
+                expected_normal = plan.source_face_normals[level_index][
+                    transverse_index
+                ]
+                if face.normal.dot(expected_normal) < 0.0:
+                    face.normal_flip()
+                source_face = plan.band_faces[transverse_index][source_interval]
+                face.material_index = plan.source_face_materials[level_index][
+                    transverse_index
+                ]
+                _copy_custom_data_layers(
+                    face, source_face, edit_mesh.faces.layers
+                )
+                for destination_loop, source_loop in zip(
+                    face.loops, source_face.loops
+                ):
+                    _copy_custom_data_layers(
+                        destination_loop, source_loop, edit_mesh.loops.layers
+                    )
+
+        chains = tuple(
+            tuple(new_levels[level][chain] for level in range(level_count))
+            for chain in range(chain_count)
+        )
+        staged_faces = _collect_longitudinal_band_faces(
+            chains, plan.section_type
+        )
+        if any(
+            not vertex.is_valid or not vertex.link_edges
+            for vertex in created_vertices
+        ):
+            raise RuntimeError("Longitudinal staging produced loose geometry")
+        if any(
+            not vertex.is_valid or vertex.co != coordinate
+            for base, coordinates in zip(plan.base_vertices, plan.base_coordinates)
+            for vertex, coordinate in zip(base, coordinates)
+        ):
+            raise RuntimeError("Longitudinal staging changed a base")
+        if any(
+            face.calc_area() <= _GEOMETRY_EPSILON
+            for row in staged_faces
+            for face in row
+        ):
+            raise RuntimeError("Longitudinal staging produced a degenerate face")
+        staged_edges = tuple(
+            _find_connecting_edge(first, second)
+            for chain in chains
+            for first, second in zip(chain, chain[1:])
+        )
+        if any(edge is None for edge in staged_edges):
+            raise RuntimeError("Longitudinal staging is missing a rail edge")
+        staged_analysis = analyze_longitudinal_bend(staged_edges)
+        if (
+            not staged_analysis.valid
+            or staged_analysis.current_cuts != plan.target_cuts
+            or staged_analysis.section_type is not plan.section_type
+        ):
+            raise RuntimeError(
+                "Longitudinal staging failed full reanalysis: "
+                f"{staged_analysis.status}"
+            )
+        return chains
+    except Exception:
+        valid_created = [vertex for vertex in created_vertices if vertex.is_valid]
+        if valid_created:
+            bmesh.ops.delete(edit_mesh, geom=valid_created, context="VERTS")
+        raise
+
+
+def _select_longitudinal_chains(
+    edit_mesh: Any,
+    chains: Sequence[Sequence[Any]],
+) -> None:
+    """Select only the final rails so Analyze Bend can run immediately."""
+    for vertex in edit_mesh.verts:
+        vertex.select = False
+    for edge in edit_mesh.edges:
+        edge.select = False
+    for face in edit_mesh.faces:
+        face.select = False
+    for chain in chains:
+        for vertex in chain:
+            if not vertex.is_valid:
+                raise RuntimeError("A final longitudinal vertex is invalid")
+            vertex.select = True
+        for first, second in zip(chain, chain[1:]):
+            edge = _find_connecting_edge(first, second)
+            if edge is None or not edge.is_valid:
+                raise RuntimeError("A final longitudinal edge is missing")
+            edge.select = True
+
+
+def validate_longitudinal_result(
+    edit_mesh: Any,
+    plan: LongitudinalResamplePlan,
+    chains: Sequence[Sequence[Any]],
+    before: tuple[int, int, int],
+) -> LongitudinalAnalysis:
+    """Validate bases, topology, data mapping, selection, and reanalysis."""
+    if any(
+        not vertex.is_valid or vertex.co != coordinate
+        for base, coordinates in zip(plan.base_vertices, plan.base_coordinates)
+        for vertex, coordinate in zip(base, coordinates)
+    ):
+        raise RuntimeError("Longitudinal resampling changed a base vertex")
+    if any(not edge.is_valid for base in plan.base_edges for edge in base):
+        raise RuntimeError("Longitudinal resampling removed a base edge")
+    if any(not element.is_valid for element in plan.external_elements):
+        raise RuntimeError("Longitudinal resampling damaged exterior geometry")
+
+    levels = build_longitudinal_levels(chains)
+    if len(levels) != plan.target_cuts + 2:
+        raise RuntimeError("Longitudinal resampling produced the wrong level count")
+    tolerance = max(_GEOMETRY_EPSILON * 100.0, plan.path_length * 1.0e-7)
+    for actual_level, expected_level in zip(levels, plan.positions):
+        for vertex, expected in zip(actual_level, expected_level):
+            if (vertex.co - expected).length > tolerance:
+                raise RuntimeError("Longitudinal resampling changed a planned position")
+
+    band_faces = _collect_longitudinal_band_faces(chains, plan.section_type)
+    for transverse_index, row in enumerate(band_faces):
+        for level_index, face in enumerate(row):
+            if face.normal.dot(
+                plan.source_face_normals[level_index][transverse_index]
+            ) <= 0.0:
+                raise RuntimeError("Longitudinal resampling inverted face winding")
+            if face.material_index != plan.source_face_materials[level_index][
+                transverse_index
+            ]:
+                raise RuntimeError("Longitudinal resampling changed a face material")
+
+    delta = plan.target_cuts - plan.current_cuts
+    chain_count = len(plan.ordered_chains)
+    transverse_count = len(
+        _longitudinal_transverse_pairs(chain_count, plan.section_type)
+    )
+    expected = (
+        before[0] + chain_count * delta,
+        before[1] + (chain_count + transverse_count) * delta,
+        before[2] + transverse_count * delta,
+    )
+    after = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
+    if after != expected:
+        raise RuntimeError("Longitudinal resampling produced unexpected topology counts")
+    if sum(vertex.select for vertex in edit_mesh.verts) != chain_count * (
+        plan.target_cuts + 2
+    ):
+        raise RuntimeError("Longitudinal resampling left an invalid vertex selection")
+    if sum(edge.select for edge in edit_mesh.edges) != chain_count * (
+        plan.target_cuts + 1
+    ):
+        raise RuntimeError("Longitudinal resampling left an invalid edge selection")
+    if any(face.select for face in edit_mesh.faces):
+        raise RuntimeError("Longitudinal resampling selected faces unexpectedly")
+
+    selected_edges = tuple(edge for edge in edit_mesh.edges if edge.select)
+    final_analysis = analyze_longitudinal_bend(selected_edges)
+    if not final_analysis.valid:
+        raise RuntimeError(
+            f"Longitudinal reanalysis failed: {final_analysis.status}"
+        )
+    if final_analysis.current_cuts != plan.target_cuts:
+        raise RuntimeError("Longitudinal reanalysis found the wrong Current Cuts")
+    if final_analysis.section_type is not plan.section_type:
+        raise RuntimeError("Longitudinal resampling changed cross-section topology")
+    return final_analysis
+
+
+def resample_longitudinal_bend(
+    edit_mesh: Any,
+    plan: LongitudinalResamplePlan,
+) -> LongitudinalResampleResult:
+    """Stage, replace, select, and validate one longitudinal bend."""
+    before = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
+    new_chains = _create_longitudinal_geometry(edit_mesh, plan)
+    old_interior_vertices = tuple(
+        vertex for level in plan.levels[1:-1] for vertex in level
+    )
+    bmesh.ops.delete(
+        edit_mesh, geom=old_interior_vertices, context="VERTS"
+    )
+    edit_mesh.verts.ensure_lookup_table()
+    edit_mesh.edges.ensure_lookup_table()
+    edit_mesh.faces.ensure_lookup_table()
+    _select_longitudinal_chains(edit_mesh, new_chains)
+    edit_mesh.normal_update()
+    final_analysis = validate_longitudinal_result(
+        edit_mesh, plan, new_chains, before
+    )
+    after = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
+    return LongitudinalResampleResult(
+        success=True,
+        message=(
+            f"Resampled longitudinal cuts: {plan.current_cuts} → "
+            f"{plan.target_cuts} | Bases preserved | "
+            f"Section: {plan.section_type.value} | "
+            f"Path Shape: {plan.path_shape.value.title()}"
+        ),
+        chains=tuple(tuple(chain) for chain in new_chains),
+        analysis=final_analysis,
         vertex_count_before=before[0],
         vertex_count_after=after[0],
         edge_count_before=before[1],

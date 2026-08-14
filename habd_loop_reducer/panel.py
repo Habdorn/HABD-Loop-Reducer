@@ -19,6 +19,67 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
         settings = context.scene.habd_loop_reducer
 
         layout.label(text="HABD Loop Reducer")
+        layout.prop(settings, "resample_direction", text="Direction")
+
+        if settings.resample_direction == "LONGITUDINAL":
+            layout.prop(settings, "longitudinal_path_shape", text="Path Shape")
+            analyze_row = layout.row()
+            analyze_row.enabled = is_valid_edit_mesh_context(context)
+            analyze_row.operator(
+                "mesh.habd_analyze_longitudinal",
+                text="Analyze Bend",
+            )
+
+            analysis_box = layout.box()
+            analysis_box.label(text="Bend Resampling")
+            analysis_box.label(
+                text=f"Input: {settings.longitudinal_selection_kind.title()}"
+            )
+            bases = "Detected" if settings.longitudinal_analysis_valid else "Not Detected"
+            analysis_box.label(text=f"Bases: {bases}")
+            analysis_box.label(
+                text=f"Cross-Section: {settings.longitudinal_section_type.title()}"
+            )
+            analysis_box.label(
+                text=f"Current Cuts: {settings.longitudinal_current_cuts}"
+            )
+            analysis_box.prop(
+                settings, "longitudinal_target_cuts", text="Target Cuts"
+            )
+            change = (
+                settings.longitudinal_target_cuts
+                - settings.longitudinal_current_cuts
+            )
+            analysis_box.label(text=f"Change: {change:+d}")
+            analysis_box.label(
+                text=f"Levels: {settings.longitudinal_level_count}"
+            )
+            analysis_box.prop(
+                settings, "longitudinal_path_length", text="Path Length"
+            )
+            analysis_box.label(text=f"Status: {settings.longitudinal_status}")
+
+            ready = (
+                settings.longitudinal_analysis_valid
+                and settings.longitudinal_target_cuts >= 1
+                and settings.longitudinal_target_cuts
+                != settings.longitudinal_current_cuts
+            )
+            guidance = layout.column()
+            guidance.alert = not ready
+            if ready:
+                guidance.label(text=f"Bend resample ready ({change:+d})")
+            elif settings.longitudinal_analysis_valid:
+                guidance.label(text="Target already matches Current Cuts")
+            else:
+                guidance.label(text="Analyze the bend before applying")
+            operator_row = layout.row()
+            operator_row.enabled = (
+                is_valid_edit_mesh_context(context) and ready
+            )
+            operator_row.operator("mesh.habd_reduce_loops", text="Apply Cuts")
+            return
+
         layout.prop(settings, "geometry_mode", text="Geometry Mode")
 
         if settings.geometry_mode == "PROFILE":
