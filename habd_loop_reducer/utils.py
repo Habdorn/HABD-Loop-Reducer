@@ -370,6 +370,43 @@ class LongitudinalResamplePlan:
 
 
 @dataclass(frozen=True)
+class _LongitudinalSelectionSnapshot:
+    """Selection state that must be restored if staging is discarded."""
+
+    vertices: tuple[Any, ...]
+    edges: tuple[Any, ...]
+    faces: tuple[Any, ...]
+    history: tuple[Any, ...]
+    select_mode: frozenset[str]
+
+
+@dataclass(frozen=True)
+class _LongitudinalCustomDataCopy:
+    """One assignable custom-data value copied into staged geometry."""
+
+    destination: Any
+    layer: Any
+    expected: Any
+
+
+@dataclass(frozen=True)
+class LongitudinalStaging:
+    """Complete reversible replacement waiting for its destructive commit."""
+
+    chains: tuple[tuple[Any, ...], ...]
+    created_vertices: tuple[Any, ...]
+    created_edges: tuple[Any, ...]
+    created_faces: tuple[Any, ...]
+    rail_edges: tuple[Any, ...]
+    band_faces: tuple[tuple[Any, ...], ...]
+    selection_vertices: tuple[Any, ...]
+    selection_edges: tuple[Any, ...]
+    custom_data_copies: tuple[_LongitudinalCustomDataCopy, ...]
+    analysis: LongitudinalAnalysis
+    projected_counts: tuple[int, int, int]
+
+
+@dataclass(frozen=True)
 class LongitudinalResampleResult:
     """Final longitudinal chains, analysis, and topology counts."""
 
@@ -4858,15 +4895,153 @@ def build_longitudinal_resample_plan(
     )
 
 
+def _freeze_longitudinal_custom_data(value: Any) -> Any:
+    """Convert a copied custom-data value into a stable comparison value."""
+    if isinstance(value, (bool, int, float, str, bytes, type(None))):
+        return value
+    attributes = tuple(
+        name
+        for name in ("uv", "color", "value", "pin_uv", "select", "select_edge")
+        if hasattr(value, name)
+    )
+    if attributes:
+        return tuple(
+            (name, _freeze_longitudinal_custom_data(getattr(value, name)))
+            for name in attributes
+        )
+    items = getattr(value, "items", None)
+    if items is not None:
+        try:
+            return tuple(sorted(items()))
+        except (AttributeError, TypeError, ValueError):
+            pass
+    try:
+        return tuple(_freeze_longitudinal_custom_data(item) for item in value)
+    except TypeError:
+        copier = getattr(value, "copy", None)
+        return copier() if copier is not None else value
+
+
+def _copy_longitudinal_custom_data_layers(
+    destination: Any,
+    source: Any,
+    layer_access: Any,
+    copies: list[_LongitudinalCustomDataCopy],
+) -> None:
+    """Copy and journal every assignable staged custom-data value."""
+    for collection_name in dir(layer_access):
+        if collection_name.startswith("_"):
+            continue
+        collection = getattr(layer_access, collection_name, None)
+        if collection is None or not hasattr(collection, "keys"):
+            continue
+        for layer_name in collection.keys():
+            layer = collection.get(layer_name)
+            try:
+                value = source[layer]
+                copier = getattr(value, "copy", None)
+                destination[layer] = copier() if copier is not None else value
+                copies.append(
+                    _LongitudinalCustomDataCopy(
+                        destination=destination,
+                        layer=layer,
+                        expected=_freeze_longitudinal_custom_data(value),
+                    )
+                )
+            except (AttributeError, KeyError, TypeError, ValueError):
+                # Match the existing contract for Blender-managed read-only layers.
+                continue
+
+
+def _snapshot_longitudinal_selection(
+    edit_mesh: Any,
+) -> _LongitudinalSelectionSnapshot:
+    """Capture selected elements and ordered selection history."""
+    return _LongitudinalSelectionSnapshot(
+        vertices=tuple(vertex for vertex in edit_mesh.verts if vertex.select),
+        edges=tuple(edge for edge in edit_mesh.edges if edge.select),
+        faces=tuple(face for face in edit_mesh.faces if face.select),
+        history=tuple(edit_mesh.select_history),
+        select_mode=frozenset(edit_mesh.select_mode),
+    )
+
+
+def _restore_longitudinal_selection(
+    edit_mesh: Any,
+    snapshot: _LongitudinalSelectionSnapshot,
+) -> None:
+    """Restore the exact live selection after discarding staged geometry."""
+    edit_mesh.select_mode = set(snapshot.select_mode)
+    for sequence in (edit_mesh.verts, edit_mesh.edges, edit_mesh.faces):
+        for element in sequence:
+            element.select = False
+    for element in snapshot.vertices + snapshot.edges + snapshot.faces:
+        if element.is_valid:
+            element.select = True
+    edit_mesh.select_history.clear()
+    for element in snapshot.history:
+        if element.is_valid and element.select:
+            edit_mesh.select_history.add(element)
+
+
+def _discard_longitudinal_vertices(
+    edit_mesh: Any,
+    vertices: Sequence[Any],
+) -> None:
+    """Delete only live staged vertices and their staged incident geometry."""
+    valid_vertices = tuple(vertex for vertex in vertices if vertex.is_valid)
+    if valid_vertices:
+        bmesh.ops.delete(edit_mesh, geom=valid_vertices, context="VERTS")
+
+
+def _resolve_longitudinal_selection(
+    chains: Sequence[Sequence[Any]],
+) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    """Resolve the final rail selection without changing mesh selection state."""
+    vertices = tuple(vertex for chain in chains for vertex in chain)
+    if any(not vertex.is_valid for vertex in vertices):
+        raise RuntimeError("A staged longitudinal vertex is invalid")
+    edges = tuple(
+        _find_connecting_edge(first, second)
+        for chain in chains
+        for first, second in zip(chain, chain[1:])
+    )
+    if any(edge is None or not edge.is_valid for edge in edges):
+        raise RuntimeError("A staged longitudinal rail edge is missing")
+    return vertices, edges
+
+
+def _apply_longitudinal_selection(
+    edit_mesh: Any,
+    vertices: Sequence[Any],
+    edges: Sequence[Any],
+) -> None:
+    """Apply a pre-resolved selection without performing domain lookups."""
+    edit_mesh.select_mode = {"EDGE"}
+    for sequence in (edit_mesh.verts, edit_mesh.edges, edit_mesh.faces):
+        for element in sequence:
+            element.select = False
+    edit_mesh.select_history.clear()
+    for vertex in vertices:
+        vertex.select = True
+    for edge in edges:
+        edge.select = True
+        edit_mesh.select_history.add(edge)
+
+
 def _create_longitudinal_geometry(
     edit_mesh: Any,
     plan: LongitudinalResamplePlan,
-) -> tuple[tuple[Any, ...], ...]:
-    """Stage a complete new bend while the original interior still exists."""
+    before: tuple[int, int, int],
+) -> LongitudinalStaging:
+    """Build and journal a complete replacement while originals remain live."""
     level_count = plan.target_cuts + 2
     chain_count = len(plan.ordered_chains)
     new_levels: list[tuple[Any, ...]] = [plan.base_vertices[0]]
     created_vertices = []
+    created_edges = []
+    created_faces = []
+    custom_data_copies: list[_LongitudinalCustomDataCopy] = []
     try:
         for level_index in range(1, level_count - 1):
             source_index, blend = plan.position_sources[level_index]
@@ -4876,12 +5051,13 @@ def _create_longitudinal_geometry(
                 vertex = edit_mesh.verts.new(
                     plan.positions[level_index][chain_index]
                 )
-                _copy_custom_data_layers(
+                created_vertices.append(vertex)
+                _copy_longitudinal_custom_data_layers(
                     vertex,
                     plan.levels[source_level][chain_index],
                     edit_mesh.verts.layers,
+                    custom_data_copies,
                 )
-                created_vertices.append(vertex)
                 level.append(vertex)
             new_levels.append(tuple(level))
         new_levels.append(plan.base_vertices[1])
@@ -4894,6 +5070,7 @@ def _create_longitudinal_geometry(
                         new_levels[level_index + 1][chain_index],
                     )
                 )
+                created_edges.append(edge)
                 source_edge = _find_connecting_edge(
                     plan.ordered_chains[chain_index][
                         plan.interval_sources[level_index]
@@ -4904,8 +5081,11 @@ def _create_longitudinal_geometry(
                 )
                 if source_edge is None:
                     raise RuntimeError("A source longitudinal edge disappeared")
-                _copy_custom_data_layers(
-                    edge, source_edge, edit_mesh.edges.layers
+                _copy_longitudinal_custom_data_layers(
+                    edge,
+                    source_edge,
+                    edit_mesh.edges.layers,
+                    custom_data_copies,
                 )
 
         transverse_pairs = _longitudinal_transverse_pairs(
@@ -4918,14 +5098,18 @@ def _create_longitudinal_geometry(
                 edge = edit_mesh.edges.new(
                     (new_levels[level_index][first], new_levels[level_index][second])
                 )
+                created_edges.append(edge)
                 source_edge = _find_connecting_edge(
                     plan.levels[source_level][first],
                     plan.levels[source_level][second],
                 )
                 if source_edge is None:
                     raise RuntimeError("A source transverse edge disappeared")
-                _copy_custom_data_layers(
-                    edge, source_edge, edit_mesh.edges.layers
+                _copy_longitudinal_custom_data_layers(
+                    edge,
+                    source_edge,
+                    edit_mesh.edges.layers,
+                    custom_data_copies,
                 )
 
         for level_index in range(level_count - 1):
@@ -4939,6 +5123,7 @@ def _create_longitudinal_geometry(
                         new_levels[level_index + 1][first],
                     )
                 )
+                created_faces.append(face)
                 face.normal_update()
                 expected_normal = plan.source_face_normals[level_index][
                     transverse_index
@@ -4949,48 +5134,29 @@ def _create_longitudinal_geometry(
                 face.material_index = plan.source_face_materials[level_index][
                     transverse_index
                 ]
-                _copy_custom_data_layers(
-                    face, source_face, edit_mesh.faces.layers
+                _copy_longitudinal_custom_data_layers(
+                    face,
+                    source_face,
+                    edit_mesh.faces.layers,
+                    custom_data_copies,
                 )
                 for destination_loop, source_loop in zip(
                     face.loops, source_face.loops
                 ):
-                    _copy_custom_data_layers(
-                        destination_loop, source_loop, edit_mesh.loops.layers
+                    _copy_longitudinal_custom_data_layers(
+                        destination_loop,
+                        source_loop,
+                        edit_mesh.loops.layers,
+                        custom_data_copies,
                     )
 
         chains = tuple(
             tuple(new_levels[level][chain] for level in range(level_count))
             for chain in range(chain_count)
         )
-        staged_faces = _collect_longitudinal_band_faces(
-            chains, plan.section_type
-        )
-        if any(
-            not vertex.is_valid or not vertex.link_edges
-            for vertex in created_vertices
-        ):
-            raise RuntimeError("Longitudinal staging produced loose geometry")
-        if any(
-            not vertex.is_valid or vertex.co != coordinate
-            for base, coordinates in zip(plan.base_vertices, plan.base_coordinates)
-            for vertex, coordinate in zip(base, coordinates)
-        ):
-            raise RuntimeError("Longitudinal staging changed a base")
-        if any(
-            face.calc_area() <= _GEOMETRY_EPSILON
-            for row in staged_faces
-            for face in row
-        ):
-            raise RuntimeError("Longitudinal staging produced a degenerate face")
-        staged_edges = tuple(
-            _find_connecting_edge(first, second)
-            for chain in chains
-            for first, second in zip(chain, chain[1:])
-        )
-        if any(edge is None for edge in staged_edges):
-            raise RuntimeError("Longitudinal staging is missing a rail edge")
-        staged_analysis = analyze_longitudinal_bend(staged_edges)
+        band_faces = _collect_longitudinal_band_faces(chains, plan.section_type)
+        selection_vertices, rail_edges = _resolve_longitudinal_selection(chains)
+        staged_analysis = analyze_longitudinal_bend(rail_edges)
         if (
             not staged_analysis.valid
             or staged_analysis.current_cuts != plan.target_cuts
@@ -5000,44 +5166,52 @@ def _create_longitudinal_geometry(
                 "Longitudinal staging failed full reanalysis: "
                 f"{staged_analysis.status}"
             )
-        return chains
+        projected_analysis = _longitudinal_analysis_result(
+            True,
+            staged_analysis.status,
+            selection_kind=staged_analysis.selection_kind,
+            section_type=staged_analysis.section_type,
+            ordered_chains=staged_analysis.ordered_chains,
+            levels=staged_analysis.levels,
+            band_faces=staged_analysis.band_faces,
+            centers=staged_analysis.centers,
+            cumulative_lengths=staged_analysis.cumulative_lengths,
+            path_length=staged_analysis.path_length,
+            base_edges=staged_analysis.base_edges,
+            external_elements=plan.external_elements,
+        )
+        delta = plan.target_cuts - plan.current_cuts
+        transverse_count = len(transverse_pairs)
+        projected_counts = (
+            before[0] + chain_count * delta,
+            before[1] + (chain_count + transverse_count) * delta,
+            before[2] + transverse_count * delta,
+        )
+        return LongitudinalStaging(
+            chains=chains,
+            created_vertices=tuple(created_vertices),
+            created_edges=tuple(created_edges),
+            created_faces=tuple(created_faces),
+            rail_edges=rail_edges,
+            band_faces=band_faces,
+            selection_vertices=selection_vertices,
+            selection_edges=rail_edges,
+            custom_data_copies=tuple(custom_data_copies),
+            analysis=projected_analysis,
+            projected_counts=projected_counts,
+        )
     except Exception:
-        valid_created = [vertex for vertex in created_vertices if vertex.is_valid]
-        if valid_created:
-            bmesh.ops.delete(edit_mesh, geom=valid_created, context="VERTS")
+        _discard_longitudinal_vertices(edit_mesh, created_vertices)
         raise
-
-
-def _select_longitudinal_chains(
-    edit_mesh: Any,
-    chains: Sequence[Sequence[Any]],
-) -> None:
-    """Select only the final rails so Analyze Bend can run immediately."""
-    for vertex in edit_mesh.verts:
-        vertex.select = False
-    for edge in edit_mesh.edges:
-        edge.select = False
-    for face in edit_mesh.faces:
-        face.select = False
-    for chain in chains:
-        for vertex in chain:
-            if not vertex.is_valid:
-                raise RuntimeError("A final longitudinal vertex is invalid")
-            vertex.select = True
-        for first, second in zip(chain, chain[1:]):
-            edge = _find_connecting_edge(first, second)
-            if edge is None or not edge.is_valid:
-                raise RuntimeError("A final longitudinal edge is missing")
-            edge.select = True
 
 
 def validate_longitudinal_result(
     edit_mesh: Any,
     plan: LongitudinalResamplePlan,
-    chains: Sequence[Sequence[Any]],
+    staging: LongitudinalStaging,
     before: tuple[int, int, int],
 ) -> LongitudinalAnalysis:
-    """Validate bases, topology, data mapping, selection, and reanalysis."""
+    """Validate the staged and projected result before deleting its source."""
     if any(
         not vertex.is_valid or vertex.co != coordinate
         for base, coordinates in zip(plan.base_vertices, plan.base_coordinates)
@@ -5049,7 +5223,7 @@ def validate_longitudinal_result(
     if any(not element.is_valid for element in plan.external_elements):
         raise RuntimeError("Longitudinal resampling damaged exterior geometry")
 
-    levels = build_longitudinal_levels(chains)
+    levels = build_longitudinal_levels(staging.chains)
     if len(levels) != plan.target_cuts + 2:
         raise RuntimeError("Longitudinal resampling produced the wrong level count")
     tolerance = max(_GEOMETRY_EPSILON * 100.0, plan.path_length * 1.0e-7)
@@ -5058,7 +5232,7 @@ def validate_longitudinal_result(
             if (vertex.co - expected).length > tolerance:
                 raise RuntimeError("Longitudinal resampling changed a planned position")
 
-    band_faces = _collect_longitudinal_band_faces(chains, plan.section_type)
+    band_faces = staging.band_faces
     for transverse_index, row in enumerate(band_faces):
         for level_index, face in enumerate(row):
             if face.normal.dot(
@@ -5070,32 +5244,66 @@ def validate_longitudinal_result(
             ]:
                 raise RuntimeError("Longitudinal resampling changed a face material")
 
-    delta = plan.target_cuts - plan.current_cuts
     chain_count = len(plan.ordered_chains)
     transverse_count = len(
         _longitudinal_transverse_pairs(chain_count, plan.section_type)
     )
-    expected = (
-        before[0] + chain_count * delta,
-        before[1] + (chain_count + transverse_count) * delta,
-        before[2] + transverse_count * delta,
+    expected_created = (
+        chain_count * plan.target_cuts,
+        chain_count * (plan.target_cuts + 1)
+        + transverse_count * plan.target_cuts,
+        transverse_count * (plan.target_cuts + 1),
     )
-    after = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
-    if after != expected:
-        raise RuntimeError("Longitudinal resampling produced unexpected topology counts")
-    if sum(vertex.select for vertex in edit_mesh.verts) != chain_count * (
-        plan.target_cuts + 2
+    actual_created = (
+        len(staging.created_vertices),
+        len(staging.created_edges),
+        len(staging.created_faces),
+    )
+    if actual_created != expected_created:
+        raise RuntimeError("Longitudinal staging produced unexpected topology counts")
+    if any(
+        not element.is_valid
+        for sequence in (
+            staging.created_vertices,
+            staging.created_edges,
+            staging.created_faces,
+        )
+        for element in sequence
     ):
+        raise RuntimeError("Longitudinal staging contains invalid geometry")
+    staged_counts = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
+    if staged_counts != tuple(
+        original + created for original, created in zip(before, expected_created)
+    ):
+        raise RuntimeError("Longitudinal staging changed existing topology")
+    if staging.projected_counts != (
+        before[0] + chain_count * (plan.target_cuts - plan.current_cuts),
+        before[1]
+        + (chain_count + transverse_count)
+        * (plan.target_cuts - plan.current_cuts),
+        before[2]
+        + transverse_count * (plan.target_cuts - plan.current_cuts),
+    ):
+        raise RuntimeError("Longitudinal projected topology counts are inconsistent")
+    if any(
+        _freeze_longitudinal_custom_data(copy.destination[copy.layer])
+        != copy.expected
+        for copy in staging.custom_data_copies
+    ):
+        raise RuntimeError("Longitudinal staging changed copied custom data")
+
+    selected_vertices = {vertex for vertex in edit_mesh.verts if vertex.select}
+    selected_edges = {edge for edge in edit_mesh.edges if edge.select}
+    if selected_vertices != set(staging.selection_vertices):
         raise RuntimeError("Longitudinal resampling left an invalid vertex selection")
-    if sum(edge.select for edge in edit_mesh.edges) != chain_count * (
-        plan.target_cuts + 1
-    ):
+    if selected_edges != set(staging.selection_edges):
         raise RuntimeError("Longitudinal resampling left an invalid edge selection")
     if any(face.select for face in edit_mesh.faces):
         raise RuntimeError("Longitudinal resampling selected faces unexpectedly")
+    if edit_mesh.select_mode != {"EDGE"}:
+        raise RuntimeError("Longitudinal staging requires edge selection mode")
 
-    selected_edges = tuple(edge for edge in edit_mesh.edges if edge.select)
-    final_analysis = analyze_longitudinal_bend(selected_edges)
+    final_analysis = analyze_longitudinal_bend(staging.selection_edges)
     if not final_analysis.valid:
         raise RuntimeError(
             f"Longitudinal reanalysis failed: {final_analysis.status}"
@@ -5104,48 +5312,94 @@ def validate_longitudinal_result(
         raise RuntimeError("Longitudinal reanalysis found the wrong Current Cuts")
     if final_analysis.section_type is not plan.section_type:
         raise RuntimeError("Longitudinal resampling changed cross-section topology")
-    return final_analysis
+    return staging.analysis
 
 
 def resample_longitudinal_bend(
     edit_mesh: Any,
     plan: LongitudinalResamplePlan,
 ) -> LongitudinalResampleResult:
-    """Stage, replace, select, and validate one longitudinal bend."""
+    """Validate a reversible replacement, then commit one final deletion."""
     before = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
-    new_chains = _create_longitudinal_geometry(edit_mesh, plan)
-    old_interior_vertices = tuple(
-        vertex for level in plan.levels[1:-1] for vertex in level
-    )
-    bmesh.ops.delete(
-        edit_mesh, geom=old_interior_vertices, context="VERTS"
-    )
-    edit_mesh.verts.ensure_lookup_table()
-    edit_mesh.edges.ensure_lookup_table()
-    edit_mesh.faces.ensure_lookup_table()
-    _select_longitudinal_chains(edit_mesh, new_chains)
-    edit_mesh.normal_update()
-    final_analysis = validate_longitudinal_result(
-        edit_mesh, plan, new_chains, before
-    )
-    after = (len(edit_mesh.verts), len(edit_mesh.edges), len(edit_mesh.faces))
-    return LongitudinalResampleResult(
-        success=True,
-        message=(
-            f"Resampled longitudinal cuts: {plan.current_cuts} → "
-            f"{plan.target_cuts} | Bases preserved | "
-            f"Section: {plan.section_type.value} | "
-            f"Path Shape: {plan.path_shape.value.title()}"
-        ),
-        chains=tuple(tuple(chain) for chain in new_chains),
-        analysis=final_analysis,
-        vertex_count_before=before[0],
-        vertex_count_after=after[0],
-        edge_count_before=before[1],
-        edge_count_after=after[1],
-        face_count_before=before[2],
-        face_count_after=after[2],
-    )
+    selection_snapshot = _snapshot_longitudinal_selection(edit_mesh)
+    staging = None
+    try:
+        staging = _create_longitudinal_geometry(edit_mesh, plan, before)
+        _apply_longitudinal_selection(
+            edit_mesh,
+            staging.selection_vertices,
+            staging.selection_edges,
+        )
+        edit_mesh.normal_update()
+        final_analysis = validate_longitudinal_result(
+            edit_mesh, plan, staging, before
+        )
+
+        old_interior_vertices = tuple(
+            vertex for level in plan.levels[1:-1] for vertex in level
+        )
+        chain_count = len(plan.ordered_chains)
+        transverse_count = len(
+            _longitudinal_transverse_pairs(chain_count, plan.section_type)
+        )
+        old_edges = {
+            edge for vertex in old_interior_vertices for edge in vertex.link_edges
+        }
+        old_faces = {
+            face for vertex in old_interior_vertices for face in vertex.link_faces
+        }
+        expected_old = (
+            chain_count * plan.current_cuts,
+            chain_count * (plan.current_cuts + 1)
+            + transverse_count * plan.current_cuts,
+            transverse_count * (plan.current_cuts + 1),
+        )
+        if (
+            len(set(old_interior_vertices)) != expected_old[0]
+            or len(old_edges) != expected_old[1]
+            or len(old_faces) != expected_old[2]
+            or any(not vertex.is_valid for vertex in old_interior_vertices)
+        ):
+            raise RuntimeError("Original longitudinal interior changed before commit")
+
+        result = LongitudinalResampleResult(
+            success=True,
+            message=(
+                f"Resampled longitudinal cuts: {plan.current_cuts} → "
+                f"{plan.target_cuts} | Bases preserved | "
+                f"Section: {plan.section_type.value} | "
+                f"Path Shape: {plan.path_shape.value.title()}"
+            ),
+            chains=staging.chains,
+            analysis=final_analysis,
+            vertex_count_before=before[0],
+            vertex_count_after=staging.projected_counts[0],
+            edge_count_before=before[1],
+            edge_count_after=staging.projected_counts[1],
+            face_count_before=before[2],
+            face_count_after=staging.projected_counts[2],
+        )
+    except Exception:
+        if staging is not None:
+            _discard_longitudinal_vertices(edit_mesh, staging.created_vertices)
+        _restore_longitudinal_selection(edit_mesh, selection_snapshot)
+        edit_mesh.normal_update()
+        raise
+
+    try:
+        bmesh.ops.delete(
+            edit_mesh, geom=old_interior_vertices, context="VERTS"
+        )
+    except Exception:
+        if all(vertex.is_valid for vertex in old_interior_vertices):
+            _discard_longitudinal_vertices(edit_mesh, staging.created_vertices)
+            _restore_longitudinal_selection(edit_mesh, selection_snapshot)
+            edit_mesh.normal_update()
+        # A partial failure inside Blender's C deletion cannot be reconstructed
+        # while preserving original BMesh element identity.  All Python-domain
+        # work is therefore completed and validated before this commit boundary.
+        raise
+    return result
 
 
 def _uniform_removal_indices(current: int, remove_count: int) -> tuple[int, ...]:
