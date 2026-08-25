@@ -7,7 +7,9 @@ import bmesh
 
 from .utils import (
     analyze_curved_tube,
+    analyze_longitudinal_bend,
     analyze_profile,
+    build_longitudinal_resample_plan,
     analyze_selected_chains,
     build_profile_regions_plan,
     build_profile_resample_plan,
@@ -21,6 +23,7 @@ from .utils import (
     resample_profile,
     resample_profile_regions,
     redistribute_surviving_chains,
+    resample_longitudinal_bend,
 )
 
 
@@ -59,6 +62,25 @@ def _store_profile_analysis(settings, analysis) -> None:
         else str(len(analysis.ordered_chains))
     )
     settings.profile_status = analysis.status
+
+
+def _store_longitudinal_analysis(settings, analysis) -> None:
+    """Copy longitudinal analysis values into dedicated RNA properties."""
+    settings.longitudinal_analysis_valid = analysis.valid
+    settings.longitudinal_section_type = (
+        analysis.section_type.value
+        if analysis.section_type is not None
+        else "UNKNOWN"
+    )
+    settings.longitudinal_selection_kind = (
+        analysis.selection_kind.value.replace("_", " ")
+        if analysis.selection_kind is not None
+        else "UNKNOWN"
+    )
+    settings.longitudinal_current_cuts = analysis.current_cuts
+    settings.longitudinal_level_count = len(analysis.levels)
+    settings.longitudinal_path_length = analysis.path_length
+    settings.longitudinal_status = analysis.status
 
 
 def _profile_current_segments(analysis) -> int:
@@ -195,6 +217,38 @@ class HABD_OT_analyze_profile(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class HABD_OT_analyze_longitudinal(bpy.types.Operator):
+    """Analyze selected rails as a bend between two preserved bases."""
+
+    bl_idname = "mesh.habd_analyze_longitudinal"
+    bl_label = "Analyze Bend"
+    bl_description = "Detect bases and interior cuts without changing geometry"
+    bl_options = {"REGISTER"}
+
+    @classmethod
+    def poll(cls, context: bpy.types.Context) -> bool:
+        return is_valid_edit_mesh_context(context)
+
+    def execute(self, context: bpy.types.Context) -> set[str]:
+        settings = context.scene.habd_loop_reducer
+        edit_mesh = bmesh.from_edit_mesh(context.active_object.data)
+        selected_edges = tuple(edge for edge in edit_mesh.edges if edge.select)
+        analysis = analyze_longitudinal_bend(selected_edges)
+        _store_longitudinal_analysis(settings, analysis)
+        if not analysis.valid:
+            self.report({"WARNING"}, analysis.status)
+            return {"CANCELLED"}
+        summary = (
+            f"Input: {settings.longitudinal_selection_kind.title()} | "
+            f"Bases detected | Cuts: {analysis.current_cuts} | "
+            f"Section: {analysis.section_type.value} | "
+            f"Path: {analysis.path_length:.4f}"
+        )
+        self.report({"INFO"}, summary)
+        print(summary)
+        return {"FINISHED"}
+
+
 class HABD_OT_reduce_loops(bpy.types.Operator):
     """Resample selected longitudinal chains to the requested radial count."""
 
@@ -212,6 +266,8 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
         if not is_valid_edit_mesh_context(context):
             self.report({"ERROR"}, "An active mesh must be in Edit Mode")
             return {"CANCELLED"}
+        if settings.resample_direction == "LONGITUDINAL":
+            return self._execute_longitudinal(context, settings)
         if settings.geometry_mode == "PROFILE":
             return self._execute_profile(context, settings)
         if settings.geometry_mode == "CURVED":
@@ -257,8 +313,10 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
             bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
             settings.current_segments = target_segments
             settings.segments_to_remove = 0
-            settings.selection_compatible = False
-            settings.selection_status = "Increase completed; run detection again"
+            settings.selection_compatible = True
+            settings.selection_status = (
+                "Increase completed; target matches current segments"
+            )
             self.report({"INFO"}, result.message)
             print(result.message)
             return {"FINISHED"}
@@ -311,6 +369,56 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
         self.report({"INFO"}, message)
         print(message)
 
+        return {"FINISHED"}
+
+    def _execute_longitudinal(self, context, settings) -> set[str]:
+        """Reanalyze, plan, and replace only one bend interior."""
+        active_object = context.active_object
+        if active_object.data.shape_keys is not None:
+            self.report(
+                {"ERROR"},
+                "Longitudinal resampling is disabled for meshes with shape keys",
+            )
+            return {"CANCELLED"}
+
+        mesh = active_object.data
+        edit_mesh = bmesh.from_edit_mesh(mesh)
+        selected_edges = tuple(edge for edge in edit_mesh.edges if edge.select)
+        analysis = analyze_longitudinal_bend(selected_edges)
+        _store_longitudinal_analysis(settings, analysis)
+        if not analysis.valid:
+            self.report({"ERROR"}, analysis.status)
+            return {"CANCELLED"}
+
+        target_cuts = settings.longitudinal_target_cuts
+        if target_cuts < 1:
+            self.report({"ERROR"}, "Target Cuts must be at least 1")
+            return {"CANCELLED"}
+        if target_cuts == analysis.current_cuts:
+            settings.longitudinal_status = (
+                "Target Cuts matches Current Cuts; no changes made"
+            )
+            self.report({"INFO"}, settings.longitudinal_status)
+            return {"FINISHED"}
+
+        try:
+            plan = build_longitudinal_resample_plan(
+                analysis,
+                target_cuts,
+                settings.longitudinal_path_shape,
+            )
+            result = resample_longitudinal_bend(edit_mesh, plan)
+        except (ValueError, RuntimeError) as error:
+            settings.longitudinal_analysis_valid = False
+            settings.longitudinal_status = str(error)
+            self.report({"ERROR"}, str(error))
+            return {"CANCELLED"}
+
+        bmesh.update_edit_mesh(mesh, loop_triangles=True, destructive=True)
+        _store_longitudinal_analysis(settings, result.analysis)
+        settings.longitudinal_status = result.message
+        self.report({"INFO"}, result.message)
+        print(result.message)
         return {"FINISHED"}
 
     def _execute_profile(self, context, settings) -> set[str]:
@@ -459,5 +567,6 @@ classes = (
     HABD_OT_detect_segments,
     HABD_OT_analyze_curved_tube,
     HABD_OT_analyze_profile,
+    HABD_OT_analyze_longitudinal,
     HABD_OT_reduce_loops,
 )
