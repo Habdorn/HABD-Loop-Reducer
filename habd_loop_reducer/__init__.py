@@ -171,6 +171,11 @@ class HABD_LR_Properties(PropertyGroup):
         description="Automatically detected Rails or Cross Loops input",
         default="UNKNOWN",
     )
+    longitudinal_path_type: StringProperty(
+        name="Path Type",
+        description="Detected open or closed longitudinal topology",
+        default="UNKNOWN",
+    )
     longitudinal_path_shape: EnumProperty(
         name="Path Shape",
         description=(
@@ -192,13 +197,17 @@ class HABD_LR_Properties(PropertyGroup):
     )
     longitudinal_current_cuts: IntProperty(
         name="Current Cuts",
-        description="Interior cross-sections between Base A and Base B",
+        description=(
+            "Interior cuts for an open path or total levels for a closed path"
+        ),
         default=0,
         min=0,
     )
     longitudinal_target_cuts: IntProperty(
         name="Target Cuts",
-        description="Final number of interior cross-sections between both bases",
+        description=(
+            "Final interior cuts for an open path or total levels for a closed path"
+        ),
         default=1,
         min=1,
         max=10_000,
