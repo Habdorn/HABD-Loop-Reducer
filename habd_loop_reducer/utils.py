@@ -102,6 +102,13 @@ class LongitudinalSelectionKind(str, Enum):
     CROSS_LOOPS = "CROSS_LOOPS"
 
 
+class LongitudinalPathType(str, Enum):
+    """Longitudinal topology reconstructed from the selected mesh band."""
+
+    OPEN_PATH = "OPEN_PATH"
+    CLOSED_PATH = "CLOSED_PATH"
+
+
 class LongitudinalPathShape(str, Enum):
     """Centerline reconstruction used for longitudinal target levels."""
 
@@ -327,6 +334,7 @@ class LongitudinalAnalysis:
     status: str
     selection_kind: LongitudinalSelectionKind | None
     section_type: LongitudinalSectionType | None
+    path_type: LongitudinalPathType | None
     ordered_chains: tuple[tuple[Any, ...], ...]
     levels: tuple[tuple[Any, ...], ...]
     band_faces: tuple[tuple[Any, ...], ...]
@@ -334,11 +342,15 @@ class LongitudinalAnalysis:
     cumulative_lengths: tuple[float, ...]
     path_length: float
     base_edges: tuple[tuple[Any, ...], tuple[Any, ...]]
+    anchor_level: tuple[Any, ...]
+    anchor_edges: tuple[Any, ...]
     external_elements: tuple[Any, ...]
 
     @property
     def current_cuts(self) -> int:
         """Return the number of editable levels between the two bases."""
+        if self.path_type is LongitudinalPathType.CLOSED_PATH:
+            return len(self.levels)
         return max(0, len(self.levels) - 2)
 
 
@@ -347,6 +359,7 @@ class LongitudinalResamplePlan:
     """Immutable, fully validated plan for rebuilding one bend interior."""
 
     section_type: LongitudinalSectionType
+    path_type: LongitudinalPathType
     path_shape: LongitudinalPathShape
     current_cuts: int
     target_cuts: int
@@ -366,6 +379,9 @@ class LongitudinalResamplePlan:
     base_vertices: tuple[tuple[Any, ...], tuple[Any, ...]]
     base_coordinates: tuple[tuple[Vector, ...], tuple[Vector, ...]]
     base_edges: tuple[tuple[Any, ...], tuple[Any, ...]]
+    anchor_level: tuple[Any, ...]
+    anchor_coordinates: tuple[Vector, ...]
+    anchor_edges: tuple[Any, ...]
     external_elements: tuple[Any, ...]
 
 
@@ -3884,9 +3900,25 @@ def _longitudinal_transverse_pairs(
     )
 
 
+def _longitudinal_level_pairs(
+    level_count: int,
+    path_type: LongitudinalPathType,
+) -> tuple[tuple[int, int], ...]:
+    """Return longitudinal intervals, including the closing interval if cyclic."""
+    interval_count = (
+        level_count
+        if path_type is LongitudinalPathType.CLOSED_PATH
+        else level_count - 1
+    )
+    return tuple(
+        (index, (index + 1) % level_count) for index in range(interval_count)
+    )
+
+
 def _collect_longitudinal_band_faces(
     chains: Sequence[Sequence[Any]],
     section_type: LongitudinalSectionType,
+    path_type: LongitudinalPathType = LongitudinalPathType.OPEN_PATH,
 ) -> tuple[tuple[Any, ...], ...]:
     """Resolve the unique regular quad strip between every adjacent rail."""
     rows = []
@@ -3896,12 +3928,14 @@ def _collect_longitudinal_band_faces(
         first_chain = chains[first_index]
         second_chain = chains[second_index]
         row = []
-        for level_index in range(len(first_chain) - 1):
+        for first_level, second_level in _longitudinal_level_pairs(
+            len(first_chain), path_type
+        ):
             face = _find_lateral_face(
-                first_chain[level_index],
-                first_chain[level_index + 1],
-                second_chain[level_index],
-                second_chain[level_index + 1],
+                first_chain[first_level],
+                first_chain[second_level],
+                second_chain[first_level],
+                second_chain[second_level],
             )
             if face is None or len(face.verts) != 4:
                 raise ValueError("Longitudinal resampling requires a regular quad band")
@@ -3955,17 +3989,36 @@ def _longitudinal_base_edges(
     return tuple(result)
 
 
+def _longitudinal_level_edges(
+    level: Sequence[Any],
+    section_type: LongitudinalSectionType,
+) -> tuple[Any, ...]:
+    """Resolve every transverse edge belonging to one preserved level."""
+    edges = tuple(
+        _find_connecting_edge(level[first], level[second])
+        for first, second in _longitudinal_transverse_pairs(
+            len(level), section_type
+        )
+    )
+    if any(edge is None for edge in edges):
+        raise ValueError("A longitudinal anchor is missing a transverse edge")
+    return edges
+
+
 def _validate_longitudinal_correspondence(
     levels: Sequence[Sequence[Any]],
     centers: Sequence[Vector],
+    path_type: LongitudinalPathType = LongitudinalPathType.OPEN_PATH,
 ) -> None:
     """Reject rails whose corresponding samples flip across the bend axis."""
-    for level_index in range(len(levels) - 1):
+    for first_level, second_level in _longitudinal_level_pairs(
+        len(levels), path_type
+    ):
         for first_vertex, second_vertex in zip(
-            levels[level_index], levels[level_index + 1]
+            levels[first_level], levels[second_level]
         ):
-            first = first_vertex.co - centers[level_index]
-            second = second_vertex.co - centers[level_index + 1]
+            first = first_vertex.co - centers[first_level]
+            second = second_vertex.co - centers[second_level]
             if (
                 first.length <= _GEOMETRY_EPSILON
                 or second.length <= _GEOMETRY_EPSILON
@@ -3980,30 +4033,57 @@ def _validate_longitudinal_correspondence(
 def _validate_longitudinal_external_geometry(
     levels: Sequence[Sequence[Any]],
     band_faces: Sequence[Sequence[Any]],
+    path_type: LongitudinalPathType = LongitudinalPathType.OPEN_PATH,
+    ignored_elements: frozenset[Any] = frozenset(),
 ) -> tuple[Any, ...]:
     """Allow arbitrary attachments at bases but reject all interior attachments."""
     allowed_faces = {face for row in band_faces for face in row}
+    allowed_closed_edges = (
+        {edge for face in allowed_faces for edge in face.edges}
+        if path_type is LongitudinalPathType.CLOSED_PATH
+        else set()
+    )
     band_vertices = {vertex for level in levels for vertex in level}
-    base_vertices = set(levels[0]) | set(levels[-1])
+    base_vertices = (
+        set(levels[0]) | set(levels[-1])
+        if path_type is LongitudinalPathType.OPEN_PATH
+        else set()
+    )
     external = set()
     for vertex in band_vertices:
         for face in vertex.link_faces:
-            if face in allowed_faces:
+            if face in allowed_faces or face in ignored_elements:
                 continue
             if vertex not in base_vertices:
                 raise ValueError(
-                    "External geometry is attached to an interior longitudinal level"
+                    (
+                        "External attachments on a closed longitudinal path are ambiguous"
+                        if path_type is LongitudinalPathType.CLOSED_PATH
+                        else "External geometry is attached to an interior longitudinal level"
+                    )
                 )
             external.add(face)
             external.update(face.edges)
             external.update(face.verts)
         for edge in vertex.link_edges:
+            if edge in ignored_elements:
+                continue
+            if path_type is LongitudinalPathType.CLOSED_PATH:
+                if edge not in allowed_closed_edges:
+                    raise ValueError(
+                        "Closed longitudinal path contains an unsupported chord or attachment"
+                    )
+                continue
             other = edge.other_vert(vertex)
             if other in band_vertices:
                 continue
             if vertex not in base_vertices:
                 raise ValueError(
-                    "External geometry is attached to an interior longitudinal level"
+                    (
+                        "External attachments on a closed longitudinal path are ambiguous"
+                        if path_type is LongitudinalPathType.CLOSED_PATH
+                        else "External geometry is attached to an interior longitudinal level"
+                    )
                 )
             external.add(edge)
             external.add(other)
@@ -4016,6 +4096,7 @@ def _longitudinal_analysis_result(
     *,
     selection_kind: LongitudinalSelectionKind | None = None,
     section_type: LongitudinalSectionType | None = None,
+    path_type: LongitudinalPathType | None = None,
     ordered_chains: tuple[tuple[Any, ...], ...] = (),
     levels: tuple[tuple[Any, ...], ...] = (),
     band_faces: tuple[tuple[Any, ...], ...] = (),
@@ -4023,6 +4104,8 @@ def _longitudinal_analysis_result(
     cumulative_lengths: tuple[float, ...] = (),
     path_length: float = 0.0,
     base_edges: tuple[tuple[Any, ...], tuple[Any, ...]] = ((), ()),
+    anchor_level: tuple[Any, ...] = (),
+    anchor_edges: tuple[Any, ...] = (),
     external_elements: tuple[Any, ...] = (),
 ) -> LongitudinalAnalysis:
     """Build one analysis result without duplicating default state."""
@@ -4031,6 +4114,7 @@ def _longitudinal_analysis_result(
         status=status,
         selection_kind=selection_kind,
         section_type=section_type,
+        path_type=path_type,
         ordered_chains=ordered_chains,
         levels=levels,
         band_faces=band_faces,
@@ -4038,6 +4122,8 @@ def _longitudinal_analysis_result(
         cumulative_lengths=cumulative_lengths,
         path_length=path_length,
         base_edges=base_edges,
+        anchor_level=anchor_level,
+        anchor_edges=anchor_edges,
         external_elements=external_elements,
     )
 
@@ -4046,6 +4132,8 @@ def _analyze_longitudinal_common(
     ordered_chains: Sequence[Sequence[Any]],
     section_type: LongitudinalSectionType,
     selection_kind: LongitudinalSelectionKind,
+    path_type: LongitudinalPathType = LongitudinalPathType.OPEN_PATH,
+    ignored_elements: frozenset[Any] = frozenset(),
 ) -> LongitudinalAnalysis:
     """Run the shared bend analysis after either input has reconstructed rails."""
     try:
@@ -4053,32 +4141,52 @@ def _analyze_longitudinal_common(
         levels = build_longitudinal_levels(ordered_chains)
         if len(levels) < 3:
             raise ValueError(
-                "Longitudinal v1 requires at least one interior cut between bases"
+                "A longitudinal path requires at least three transverse levels"
+                if path_type is LongitudinalPathType.CLOSED_PATH
+                else "Longitudinal v1 requires at least one interior cut between bases"
             )
         for level in levels:
             _validate_longitudinal_level_positions(
                 tuple(vertex.co for vertex in level), section_type
             )
         band_faces = _collect_longitudinal_band_faces(
-            ordered_chains, section_type
+            ordered_chains, section_type, path_type
         )
         centers = calculate_level_centers(levels)
-        _validate_longitudinal_correspondence(levels, centers)
+        _validate_longitudinal_correspondence(levels, centers, path_type)
         cumulative = [0.0]
-        for first, second in zip(centers, centers[1:]):
+        for first_index, second_index in _longitudinal_level_pairs(
+            len(centers), path_type
+        ):
+            first = centers[first_index]
+            second = centers[second_index]
             length = (second - first).length
             if length <= _GEOMETRY_EPSILON:
                 raise ValueError(
                     "Longitudinal centerline contains a zero-length segment"
                 )
             cumulative.append(cumulative[-1] + length)
-        base_edges = _longitudinal_base_edges(levels, section_type)
-        external = _validate_longitudinal_external_geometry(levels, band_faces)
+        if path_type is LongitudinalPathType.CLOSED_PATH:
+            base_edges = ((), ())
+            anchor_level = levels[0]
+            anchor_edges = _longitudinal_level_edges(anchor_level, section_type)
+        else:
+            base_edges = _longitudinal_base_edges(levels, section_type)
+            anchor_level = ()
+            anchor_edges = ()
+        external = _validate_longitudinal_external_geometry(
+            levels, band_faces, path_type, ignored_elements
+        )
         return _longitudinal_analysis_result(
             True,
-            f"Compatible {section_type.value.lower()} longitudinal bend",
+            (
+                f"Compatible {section_type.value.lower()} closed longitudinal path"
+                if path_type is LongitudinalPathType.CLOSED_PATH
+                else f"Compatible {section_type.value.lower()} longitudinal bend"
+            ),
             selection_kind=selection_kind,
             section_type=section_type,
+            path_type=path_type,
             ordered_chains=ordered_chains,
             levels=levels,
             band_faces=band_faces,
@@ -4086,6 +4194,8 @@ def _analyze_longitudinal_common(
             cumulative_lengths=tuple(cumulative),
             path_length=cumulative[-1],
             base_edges=base_edges,
+            anchor_level=anchor_level,
+            anchor_edges=anchor_edges,
             external_elements=external,
         )
     except ValueError as error:
@@ -4094,7 +4204,214 @@ def _analyze_longitudinal_common(
             str(error),
             selection_kind=selection_kind,
             section_type=section_type,
+            path_type=path_type,
         )
+
+
+def _longitudinal_vertex_key(
+    vertex: Any, projected_indices: dict[Any, int] | None = None,
+) -> tuple[Any, ...]:
+    """Return a stable key that keeps an existing anchor ahead of staged data."""
+    index = (
+        getattr(vertex, "index", -1)
+        if projected_indices is None
+        else projected_indices[vertex]
+    )
+    return (
+        0 if index >= 0 else 1,
+        index if index >= 0 else 0,
+        tuple(round(component, 12) for component in vertex.co),
+    )
+
+
+def _longitudinal_component_key(
+    vertices: Iterable[Any], projected_indices: dict[Any, int] | None = None,
+) -> tuple[Any, ...]:
+    """Canonical key for a transverse level or longitudinal rail component."""
+    return min(
+        _longitudinal_vertex_key(vertex, projected_indices) for vertex in vertices
+    )
+
+
+def _canonical_closed_edge_cycle(
+    component: Sequence[Any], projected_indices: dict[Any, int] | None = None,
+) -> tuple[Any, ...]:
+    """Canonicalize phase and direction of one selected edge cycle."""
+    component_edges = set(component)
+    vertices = {vertex for edge in component for vertex in edge.verts}
+    adjacency = {
+        vertex: tuple(
+            edge.other_vert(vertex)
+            for edge in vertex.link_edges
+            if edge in component_edges
+        )
+        for vertex in vertices
+    }
+    if len(vertices) < 3 or any(len(neighbors) != 2 for neighbors in adjacency.values()):
+        raise ValueError("Each closed longitudinal rail must be one simple cycle")
+    anchor = min(
+        vertices, key=lambda vertex: _longitudinal_vertex_key(vertex, projected_indices)
+    )
+    ordered = [anchor]
+    previous = anchor
+    current = adjacency[anchor][0]
+    while current is not anchor:
+        if current in ordered:
+            raise ValueError("A closed longitudinal rail crosses or repeats")
+        ordered.append(current)
+        following = [vertex for vertex in adjacency[current] if vertex is not previous]
+        if len(following) != 1:
+            raise ValueError("A closed longitudinal rail is branched")
+        previous, current = current, following[0]
+    if len(ordered) != len(vertices):
+        raise ValueError("A closed longitudinal rail is incomplete")
+    perimeter = sum(
+        (ordered[(index + 1) % len(ordered)].co - vertex.co).length
+        for index, vertex in enumerate(ordered)
+    )
+    area_vector = Vector((0.0, 0.0, 0.0))
+    anchor_position = anchor.co
+    for index, vertex in enumerate(ordered):
+        following = ordered[(index + 1) % len(ordered)]
+        area_vector += (vertex.co - anchor_position).cross(
+            following.co - anchor_position
+        )
+    dominant_axis = max(range(3), key=lambda axis: abs(area_vector[axis]))
+    orientation_tolerance = max(
+        _GEOMETRY_EPSILON * _GEOMETRY_EPSILON,
+        perimeter * perimeter * 1.0e-10,
+    )
+    if abs(area_vector[dominant_axis]) <= orientation_tolerance:
+        raise ValueError(
+            "Closed longitudinal rail has no stable canonical direction"
+        )
+    if area_vector[dominant_axis] < 0.0:
+        ordered = [ordered[0], *reversed(ordered[1:])]
+    return tuple(ordered)
+
+
+def _align_closed_rail_to_chain(
+    source_chain: Sequence[Any],
+    candidate_vertices: set[Any],
+) -> tuple[Any, ...] | None:
+    """Align one neighboring cyclic rail with exact, identity correspondence."""
+    aligned = []
+    for source in source_chain:
+        matches = tuple(
+            edge.other_vert(source)
+            for edge in source.link_edges
+            if edge.other_vert(source) in candidate_vertices
+        )
+        if len(matches) != 1:
+            return None
+        aligned.append(matches[0])
+    if len(set(aligned)) != len(source_chain) or set(aligned) != candidate_vertices:
+        return None
+    aligned = tuple(aligned)
+    for first_level, second_level in _longitudinal_level_pairs(
+        len(source_chain), LongitudinalPathType.CLOSED_PATH
+    ):
+        if _find_connecting_edge(
+            aligned[first_level], aligned[second_level]
+        ) is None:
+            return None
+        face = _find_lateral_face(
+            source_chain[first_level],
+            source_chain[second_level],
+            aligned[first_level],
+            aligned[second_level],
+        )
+        if face is None or len(face.verts) != 4:
+            return None
+    return aligned
+
+
+def _orient_and_order_closed_longitudinal_rails(
+    components: Sequence[Sequence[Any]],
+    projected_indices: dict[Any, int] | None = None,
+) -> tuple[LongitudinalSectionType, tuple[tuple[Any, ...], ...]]:
+    """Canonicalize closed rails and reject rotated or permuted monodromy."""
+    component_sets = tuple(
+        {vertex for edge in component for vertex in edge.verts}
+        for component in components
+    )
+    canonical = tuple(
+        _canonical_closed_edge_cycle(component, projected_indices)
+        for component in components
+    )
+    adjacency: list[list[int]] = [[] for _ in components]
+    for first_index, first_chain in enumerate(canonical):
+        for second_index in range(first_index + 1, len(components)):
+            if _align_closed_rail_to_chain(
+                first_chain, component_sets[second_index]
+            ) is None:
+                continue
+            adjacency[first_index].append(second_index)
+            adjacency[second_index].append(first_index)
+
+    degrees = tuple(len(neighbors) for neighbors in adjacency)
+    if len(components) >= 3 and all(degree == 2 for degree in degrees):
+        section_type = LongitudinalSectionType.CLOSED
+        start_index = min(
+            range(len(components)),
+            key=lambda index: _longitudinal_component_key(
+                component_sets[index], projected_indices
+            ),
+        )
+    elif (
+        len(components) >= 2
+        and degrees.count(1) == 2
+        and all(degree in {1, 2} for degree in degrees)
+    ):
+        section_type = LongitudinalSectionType.OPEN
+        start_index = min(
+            (index for index, degree in enumerate(degrees) if degree == 1),
+            key=lambda index: _longitudinal_component_key(
+                component_sets[index], projected_indices
+            ),
+        )
+    else:
+        raise ValueError(
+            "Closed rails do not form one complete open or closed cross-section band"
+        )
+
+    ordered_indices = [start_index]
+    ordered_chains = [canonical[start_index]]
+    previous = None
+    current = start_index
+    while True:
+        following = [index for index in adjacency[current] if index != previous]
+        if not following:
+            break
+        if len(following) > 1 and previous is None:
+            following.sort(
+                key=lambda index: _longitudinal_component_key(
+                    component_sets[index], projected_indices
+                )
+            )
+        next_index = following[0]
+        if next_index == start_index:
+            closing = _align_closed_rail_to_chain(
+                ordered_chains[-1], component_sets[start_index]
+            )
+            if closing != ordered_chains[0]:
+                raise ValueError(
+                    "Closed path has transverse rotation, permutation, or monodromy"
+                )
+            break
+        if next_index in ordered_indices:
+            raise ValueError("Closed rail ordering crosses or repeats")
+        aligned = _align_closed_rail_to_chain(
+            ordered_chains[-1], component_sets[next_index]
+        )
+        if aligned is None:
+            raise ValueError("Closed rail correspondence is incomplete")
+        ordered_indices.append(next_index)
+        ordered_chains.append(aligned)
+        previous, current = current, next_index
+    if len(ordered_indices) != len(components):
+        raise ValueError("Closed rails contain multiple bands")
+    return section_type, tuple(ordered_chains)
 
 
 def _analyze_longitudinal_rails(
@@ -4111,11 +4428,9 @@ def _analyze_longitudinal_rails(
         return _longitudinal_analysis_result(
             False, "Selection contains branched longitudinal chains"
         )
-    if any(item.is_closed for item in component_info):
-        return _longitudinal_analysis_result(
-            False, "Selected rails form closed paths"
-        )
-    if any(not item.is_open_chain for item in component_info):
+    all_closed = all(item.is_closed for item in component_info)
+    all_open = all(item.is_open_chain for item in component_info)
+    if not all_closed and not all_open:
         return _longitudinal_analysis_result(
             False, "Selection contains invalid longitudinal rails"
         )
@@ -4126,15 +4441,23 @@ def _analyze_longitudinal_rails(
             False, "Selected longitudinal rails have different levels"
         )
     try:
-        section_type, ordered_chains = _orient_and_order_longitudinal_chains(
-            components
-        )
+        if all_closed:
+            section_type, ordered_chains = (
+                _orient_and_order_closed_longitudinal_rails(components)
+            )
+            path_type = LongitudinalPathType.CLOSED_PATH
+        else:
+            section_type, ordered_chains = _orient_and_order_longitudinal_chains(
+                components
+            )
+            path_type = LongitudinalPathType.OPEN_PATH
     except ValueError as error:
         return _longitudinal_analysis_result(False, str(error))
     return _analyze_longitudinal_common(
         ordered_chains,
         section_type,
         LongitudinalSelectionKind.RAILS,
+        path_type,
     )
 
 
@@ -4327,6 +4650,29 @@ def _open_cross_loop_has_unselected_closure(
     return False
 
 
+def _canonicalize_cross_level(
+    level: Sequence[Any],
+    section_type: LongitudinalSectionType,
+) -> tuple[Any, ...]:
+    """Canonicalize transverse phase/direction without changing correspondence."""
+    level = tuple(level)
+    if section_type is LongitudinalSectionType.OPEN:
+        return (
+            tuple(reversed(level))
+            if _longitudinal_vertex_key(level[-1])
+            < _longitudinal_vertex_key(level[0])
+            else level
+        )
+    anchor_index = min(
+        range(len(level)), key=lambda index: _longitudinal_vertex_key(level[index])
+    )
+    forward = tuple(level[(anchor_index + index) % len(level)] for index in range(len(level)))
+    reverse = tuple(level[(anchor_index - index) % len(level)] for index in range(len(level)))
+    forward_neighbor = tuple(round(component, 12) for component in forward[1].co)
+    reverse_neighbor = tuple(round(component, 12) for component in reverse[1].co)
+    return reverse if reverse_neighbor < forward_neighbor else forward
+
+
 def _analyze_longitudinal_cross_loops(
     selected_edges: Sequence[Any],
 ) -> LongitudinalAnalysis:
@@ -4386,7 +4732,8 @@ def _analyze_longitudinal_cross_loops(
             adjacency[second_index].append(first_index)
 
     degrees = tuple(len(neighbors) for neighbors in adjacency)
-    if len(components) > 1 and all(degree == 2 for degree in degrees):
+    closed_component_cycle = False
+    if len(components) > 2 and all(degree == 2 for degree in degrees):
         pending = [0]
         visited = {0}
         while pending:
@@ -4395,10 +4742,83 @@ def _analyze_longitudinal_cross_loops(
                 if neighbor not in visited:
                     visited.add(neighbor)
                     pending.append(neighbor)
-        if len(visited) == len(components):
-            return _longitudinal_analysis_result(
-                False, "Closed longitudinal paths are not supported yet"
+        closed_component_cycle = len(visited) == len(components)
+
+    if closed_component_cycle:
+        start_index = min(
+            range(len(components)),
+            key=lambda index: _longitudinal_component_key(component_sets[index]),
+        )
+        anchor_level = _canonicalize_cross_level(
+            raw_levels[start_index], section_type
+        )
+        ordered_indices = [start_index]
+        selected_levels = [anchor_level]
+        previous = None
+        current = start_index
+        while True:
+            following = [item for item in adjacency[current] if item != previous]
+            if previous is None:
+                following.sort(
+                    key=lambda index: _longitudinal_component_key(
+                        component_sets[index]
+                    )
+                )
+            next_index = following[0]
+            if next_index == start_index:
+                closing = _align_cross_loop_to_level(
+                    selected_levels[-1], component_sets[start_index], section_type
+                )
+                if closing != anchor_level:
+                    return _longitudinal_analysis_result(
+                        False,
+                        "Closed path has transverse rotation, permutation, or monodromy",
+                        selection_kind=LongitudinalSelectionKind.CROSS_LOOPS,
+                        section_type=section_type,
+                        path_type=LongitudinalPathType.CLOSED_PATH,
+                    )
+                break
+            if next_index in ordered_indices:
+                return _longitudinal_analysis_result(
+                    False,
+                    "Closed cross-loop ordering crosses or repeats",
+                    selection_kind=LongitudinalSelectionKind.CROSS_LOOPS,
+                    section_type=section_type,
+                    path_type=LongitudinalPathType.CLOSED_PATH,
+                )
+            aligned = _align_cross_loop_to_level(
+                selected_levels[-1], component_sets[next_index], section_type
             )
+            if aligned is None:
+                return _longitudinal_analysis_result(
+                    False,
+                    "Closed cross-loop correspondence is incomplete",
+                    selection_kind=LongitudinalSelectionKind.CROSS_LOOPS,
+                    section_type=section_type,
+                    path_type=LongitudinalPathType.CLOSED_PATH,
+                )
+            ordered_indices.append(next_index)
+            selected_levels.append(aligned)
+            previous, current = current, next_index
+        if len(ordered_indices) != len(components):
+            return _longitudinal_analysis_result(
+                False,
+                "Closed cross-loops contain multiple bands",
+                selection_kind=LongitudinalSelectionKind.CROSS_LOOPS,
+                section_type=section_type,
+                path_type=LongitudinalPathType.CLOSED_PATH,
+            )
+        ordered_chains = tuple(
+            tuple(level[sample] for level in selected_levels)
+            for sample in range(sample_count)
+        )
+        return _analyze_longitudinal_common(
+            ordered_chains,
+            section_type,
+            LongitudinalSelectionKind.CROSS_LOOPS,
+            LongitudinalPathType.CLOSED_PATH,
+        )
+
     valid_path = (
         len(components) == 1
         or (
@@ -4513,8 +4933,7 @@ def analyze_longitudinal_bend(
     cross_loops = _analyze_longitudinal_cross_loops(selected_edges)
     if rails.valid and cross_loops.valid:
         return _longitudinal_analysis_result(
-            False,
-            "Selection is ambiguous between Rails and Cross Loops",
+            False, "Selection is ambiguous between Rails and Cross Loops"
         )
     if rails.valid:
         return rails
@@ -4596,9 +5015,11 @@ def _centripetal_catmull_rom_point(
 def _build_smooth_longitudinal_centers(
     centers: Sequence[Vector],
     target_level_count: int,
+    path_type: LongitudinalPathType = LongitudinalPathType.OPEN_PATH,
 ) -> tuple[tuple[Vector, ...], float]:
     """Build and arc-length sample one conservative smooth centerline."""
-    segment_count = len(centers) - 1
+    closed_path = path_type is LongitudinalPathType.CLOSED_PATH
+    segment_count = len(centers) if closed_path else len(centers) - 1
     samples_per_segment = max(
         24,
         min(
@@ -4607,17 +5028,24 @@ def _build_smooth_longitudinal_centers(
         ),
     )
     dense_points = [centers[0].copy()]
-    for index, (start, end) in enumerate(zip(centers, centers[1:])):
-        control_a = (
-            centers[index - 1]
-            if index > 0
-            else start + (start - end)
-        )
-        control_b = (
-            centers[index + 2]
-            if index + 2 < len(centers)
-            else end + (end - start)
-        )
+    center_pairs = _longitudinal_level_pairs(len(centers), path_type)
+    for index, (start_index, end_index) in enumerate(center_pairs):
+        start = centers[start_index]
+        end = centers[end_index]
+        if closed_path:
+            control_a = centers[(start_index - 1) % len(centers)]
+            control_b = centers[(end_index + 1) % len(centers)]
+        else:
+            control_a = (
+                centers[index - 1]
+                if index > 0
+                else start + (start - end)
+            )
+            control_b = (
+                centers[index + 2]
+                if index + 2 < len(centers)
+                else end + (end - start)
+            )
         for sample_index in range(1, samples_per_segment + 1):
             point = _centripetal_catmull_rom_point(
                 control_a,
@@ -4644,10 +5072,11 @@ def _build_smooth_longitudinal_centers(
         if level_index == 0:
             target_centers.append(centers[0].copy())
             continue
-        if level_index == target_level_count - 1:
+        if not closed_path and level_index == target_level_count - 1:
             target_centers.append(centers[-1].copy())
             continue
-        distance = level_index * path_length / (target_level_count - 1)
+        denominator = target_level_count if closed_path else target_level_count - 1
+        distance = level_index * path_length / denominator
         source_index, blend = _longitudinal_source_at_distance(
             cumulative, distance
         )
@@ -4660,10 +5089,140 @@ def _build_smooth_longitudinal_centers(
         raise ValueError("Smooth centerline self-collapses at a target level")
     if any(
         (second - first).length <= _GEOMETRY_EPSILON
-        for first, second in zip(target_centers, target_centers[1:])
+        for first_index, second_index in _longitudinal_level_pairs(
+            len(target_centers), path_type
+        )
+        for first, second in ((target_centers[first_index], target_centers[second_index]),)
     ):
         raise ValueError("Smooth centerline contains a degenerate target segment")
     return tuple(target_centers), path_length
+
+
+def _periodic_seam_turn_rotation(
+    first: Vector, second: Vector,
+) -> tuple[float, float, float, float]:
+    """Return the oriented minimal turn as a unit quaternion (w, x, y, z)."""
+    # Compute in Python double precision after reading BMesh's float32 vectors.
+    directions = []
+    for vector in (first, second):
+        length = math.hypot(*vector)
+        if not math.isfinite(length) or length <= _GEOMETRY_EPSILON:
+            raise ValueError("Periodic Smooth seam contains a degenerate direction")
+        directions.append(tuple(component / length for component in vector))
+    a, b = directions
+    cross = (
+        a[1] * b[2] - a[2] * b[1],
+        a[2] * b[0] - a[0] * b[2],
+        a[0] * b[1] - a[1] * b[0],
+    )
+    sine = math.hypot(*cross)
+    cosine = max(-1.0, min(1.0, sum(x * y for x, y in zip(a, b))))
+    # Within ~0.0006 degrees of a U-turn, float32 noise can choose the axis.
+    # Reject that ambiguity rather than inventing a global fallback axis.
+    if cosine < 0.0 and sine <= 1.0e-5:
+        raise ValueError("Periodic Smooth geometry has an ambiguous near-180-degree turn")
+    if sine == 0.0:
+        return (1.0, 0.0, 0.0, 0.0)
+    half_angle = 0.5 * math.atan2(sine, cosine)
+    scale = math.sin(half_angle) / sine
+    return (math.cos(half_angle), *(component * scale for component in cross))
+
+
+def _signed_periodic_section_twist(
+    first_position: Vector,
+    second_position: Vector,
+    first_center: Vector,
+    second_center: Vector,
+) -> float:
+    """Measure signed section rotation through one periodic interval."""
+    axis = second_center - first_center
+    if axis.length <= _GEOMETRY_EPSILON:
+        raise ValueError("Periodic Smooth seam contains a degenerate interval")
+    axis.normalize()
+    first_offset = first_position - first_center
+    second_offset = second_position - second_center
+    first_projected = first_offset - axis * first_offset.dot(axis)
+    second_projected = second_offset - axis * second_offset.dot(axis)
+    if (
+        first_projected.length <= _GEOMETRY_EPSILON
+        or second_projected.length <= _GEOMETRY_EPSILON
+    ):
+        raise ValueError(
+            "Periodic Smooth seam orientation cannot be determined conservatively"
+        )
+    first_projected.normalize()
+    second_projected.normalize()
+    return math.atan2(
+        axis.dot(first_projected.cross(second_projected)),
+        max(-1.0, min(1.0, first_projected.dot(second_projected))),
+    )
+
+
+def _periodic_angle_difference(first: float, second: float) -> float:
+    """Return the shortest absolute difference between two signed angles."""
+    return abs(math.atan2(math.sin(first - second), math.cos(first - second)))
+
+
+def _validate_periodic_smooth_seam(
+    positions: Sequence[Sequence[Vector]],
+    centers: Sequence[Vector],
+) -> None:
+    """Reject a geometric or orientational discontinuity at the fixed anchor."""
+    if len(positions) < 3:
+        raise ValueError("Periodic Smooth seam needs at least three levels")
+    angular_tolerance = math.radians(5.0)
+    level_pairs = _longitudinal_level_pairs(
+        len(positions), LongitudinalPathType.CLOSED_PATH
+    )
+    chain_count = len(positions[0])
+    for chain_index in range(chain_count):
+        twists = tuple(
+            _signed_periodic_section_twist(
+                positions[first_level][chain_index],
+                positions[second_level][chain_index],
+                centers[first_level],
+                centers[second_level],
+            )
+            for first_level, second_level in level_pairs
+        )
+        if any(
+            _periodic_angle_difference(twists[first], twists[second])
+            > angular_tolerance
+            for first, second in (
+                (len(twists) - 1, len(twists) - 2),
+                (len(twists) - 1, 0),
+                (0, 1),
+            )
+        ):
+            raise ValueError(
+                "Periodic Smooth closing twist is discontinuous at the anchor"
+            )
+
+        incoming_rail = (
+            positions[0][chain_index] - positions[-1][chain_index]
+        )
+        outgoing_rail = (
+            positions[1][chain_index] - positions[0][chain_index]
+        )
+        incoming_center = centers[0] - centers[-1]
+        outgoing_center = centers[1] - centers[0]
+        rail_turn = _periodic_seam_turn_rotation(
+            incoming_rail, outgoing_rail
+        )
+        center_turn = _periodic_seam_turn_rotation(
+            incoming_center, outgoing_center
+        )
+        # SO(3) distance: q and -q represent the same rotation.  The chord
+        # formula avoids acos cancellation near zero and retains axis/sign.
+        difference = math.hypot(*(a - b for a, b in zip(rail_turn, center_turn)))
+        total = math.hypot(*(a + b for a, b in zip(rail_turn, center_turn)))
+        rotation_error = 4.0 * math.atan2(
+            min(difference, total), max(difference, total)
+        )
+        if rotation_error > angular_tolerance:
+            raise ValueError(
+                "Periodic Smooth geometry is discontinuous at the fixed anchor"
+            )
 
 
 def _build_smooth_longitudinal_positions(
@@ -4677,20 +5236,48 @@ def _build_smooth_longitudinal_positions(
 ]:
     """Place interpolated source sections on one shared smooth centerline."""
     target_centers, target_path_length = _build_smooth_longitudinal_centers(
-        analysis.centers, final_level_count
+        analysis.centers, final_level_count, analysis.path_type
     )
-    source_tangents = calculate_local_tangents(analysis.centers)
-    target_tangents = calculate_local_tangents(target_centers)
+    if analysis.path_type is LongitudinalPathType.CLOSED_PATH:
+        source_tangent_vectors = tuple(
+            analysis.centers[(index + 1) % len(analysis.centers)]
+            - analysis.centers[(index - 1) % len(analysis.centers)]
+            for index in range(len(analysis.centers))
+        )
+        target_tangent_vectors = tuple(
+            target_centers[(index + 1) % len(target_centers)]
+            - target_centers[(index - 1) % len(target_centers)]
+            for index in range(len(target_centers))
+        )
+        if any(
+            tangent.length <= _GEOMETRY_EPSILON
+            for tangent in source_tangent_vectors + target_tangent_vectors
+        ):
+            raise ValueError("Periodic Smooth path has a degenerate centered tangent")
+        source_tangents = tuple(
+            tangent.normalized() for tangent in source_tangent_vectors
+        )
+        target_tangents = tuple(
+            tangent.normalized() for tangent in target_tangent_vectors
+        )
+    else:
+        source_tangents = calculate_local_tangents(analysis.centers)
+        target_tangents = calculate_local_tangents(target_centers)
     if any(
         first.dot(second) <= _FRAME_FLIP_DOT_THRESHOLD
-        for first, second in zip(target_tangents, target_tangents[1:])
+        for first_index, second_index in _longitudinal_level_pairs(
+            len(target_tangents), analysis.path_type
+        )
+        for first, second in ((target_tangents[first_index], target_tangents[second_index]),)
     ):
         raise ValueError("Smooth centerline contains an extreme tangent flip")
 
     positions = []
     position_sources = []
     for level_index in range(final_level_count):
-        fraction = level_index / (final_level_count - 1)
+        closed_path = analysis.path_type is LongitudinalPathType.CLOSED_PATH
+        denominator = final_level_count if closed_path else final_level_count - 1
+        fraction = level_index / denominator
         source_index, blend = _longitudinal_source_at_distance(
             analysis.cumulative_lengths, fraction * analysis.path_length
         )
@@ -4699,17 +5286,17 @@ def _build_smooth_longitudinal_positions(
             level_positions = tuple(
                 vertex.co.copy() for vertex in analysis.levels[0]
             )
-        elif level_index == final_level_count - 1:
+        elif not closed_path and level_index == final_level_count - 1:
             source_index, blend = len(analysis.levels) - 2, 1.0
             level_positions = tuple(
                 vertex.co.copy() for vertex in analysis.levels[-1]
             )
         else:
             source_center = analysis.centers[source_index].lerp(
-                analysis.centers[source_index + 1], blend
+                analysis.centers[(source_index + 1) % len(analysis.centers)], blend
             )
             source_tangent = source_tangents[source_index].lerp(
-                source_tangents[source_index + 1], blend
+                source_tangents[(source_index + 1) % len(source_tangents)], blend
             )
             if source_tangent.length <= _GEOMETRY_EPSILON:
                 raise ValueError("Smooth source frame has an invalid tangent")
@@ -4723,7 +5310,9 @@ def _build_smooth_longitudinal_positions(
                 + rotation
                 @ (
                     analysis.levels[source_index][chain_index].co.lerp(
-                        analysis.levels[source_index + 1][chain_index].co,
+                        analysis.levels[
+                            (source_index + 1) % len(analysis.levels)
+                        ][chain_index].co,
                         blend,
                     )
                     - source_center
@@ -4742,12 +5331,13 @@ def _build_smooth_longitudinal_positions(
         position_sources.append((source_index, blend))
         positions.append(level_positions)
 
-    for first_level, second_level, first_center, second_center in zip(
-        positions,
-        positions[1:],
-        target_centers,
-        target_centers[1:],
+    for first_index, second_index in _longitudinal_level_pairs(
+        len(positions), analysis.path_type
     ):
+        first_level = positions[first_index]
+        second_level = positions[second_index]
+        first_center = target_centers[first_index]
+        second_center = target_centers[second_index]
         for first, second in zip(first_level, second_level):
             first_offset = first - first_center
             second_offset = second - second_center
@@ -4759,6 +5349,8 @@ def _build_smooth_longitudinal_positions(
                 raise ValueError("Smooth path would twist a cross-section")
             if (second - first).length <= _GEOMETRY_EPSILON:
                 raise ValueError("Smooth path would collapse a longitudinal rail")
+    if analysis.path_type is LongitudinalPathType.CLOSED_PATH:
+        _validate_periodic_smooth_seam(positions, target_centers)
     return (
         tuple(positions),
         tuple(position_sources),
@@ -4775,8 +5367,17 @@ def build_longitudinal_resample_plan(
     """Plan every target level and data transfer before touching BMesh."""
     if not analysis.valid or analysis.section_type is None:
         raise ValueError(analysis.status)
-    if target_cuts < 1:
-        raise ValueError("Target Cuts must be at least 1 in longitudinal v1")
+    minimum_target = (
+        3
+        if analysis.path_type is LongitudinalPathType.CLOSED_PATH
+        else 1
+    )
+    if target_cuts < minimum_target:
+        raise ValueError(
+            "A closed longitudinal path requires at least 3 levels"
+            if analysis.path_type is LongitudinalPathType.CLOSED_PATH
+            else "Target Cuts must be at least 1 in longitudinal v1"
+        )
     if target_cuts == analysis.current_cuts:
         raise ValueError("Target Cuts already matches Current Cuts")
     try:
@@ -4784,22 +5385,25 @@ def build_longitudinal_resample_plan(
     except ValueError as error:
         raise ValueError("Unknown longitudinal Path Shape") from error
 
-    final_level_count = target_cuts + 2
+    closed_path = analysis.path_type is LongitudinalPathType.CLOSED_PATH
+    final_level_count = target_cuts if closed_path else target_cuts + 2
     if path_shape is LongitudinalPathShape.PRESERVE:
         position_sources = []
         positions = []
         for level_index in range(final_level_count):
-            fraction = level_index / (final_level_count - 1)
+            denominator = final_level_count if closed_path else final_level_count - 1
+            fraction = level_index / denominator
             source_index, blend = _longitudinal_source_at_distance(
                 analysis.cumulative_lengths, fraction * analysis.path_length
             )
             if level_index == 0:
                 source_index, blend = 0, 0.0
-            elif level_index == final_level_count - 1:
+            elif not closed_path and level_index == final_level_count - 1:
                 source_index, blend = len(analysis.levels) - 2, 1.0
+            next_source_index = (source_index + 1) % len(analysis.levels)
             level_positions = tuple(
                 analysis.levels[source_index][chain_index].co.lerp(
-                    analysis.levels[source_index + 1][chain_index].co, blend
+                    analysis.levels[next_source_index][chain_index].co, blend
                 )
                 for chain_index in range(len(analysis.ordered_chains))
             )
@@ -4815,8 +5419,10 @@ def build_longitudinal_resample_plan(
             for level in positions
         )
         target_path_length = sum(
-            (second - first).length
-            for first, second in zip(target_centers, target_centers[1:])
+            (target_centers[second] - target_centers[first]).length
+            for first, second in _longitudinal_level_pairs(
+                len(target_centers), analysis.path_type
+            )
         )
     else:
         (
@@ -4834,8 +5440,12 @@ def build_longitudinal_resample_plan(
     transverse_pairs = _longitudinal_transverse_pairs(
         len(analysis.ordered_chains), analysis.section_type
     )
-    for interval in range(final_level_count - 1):
-        midpoint_fraction = (interval + 0.5) / (final_level_count - 1)
+    target_intervals = _longitudinal_level_pairs(
+        final_level_count, analysis.path_type
+    )
+    for interval, (first_level, second_level) in enumerate(target_intervals):
+        denominator = final_level_count if closed_path else final_level_count - 1
+        midpoint_fraction = (interval + 0.5) / denominator
         source_index, _ = _longitudinal_source_at_distance(
             analysis.cumulative_lengths,
             midpoint_fraction * analysis.path_length,
@@ -4844,10 +5454,10 @@ def build_longitudinal_resample_plan(
         normals = []
         materials = []
         for transverse_index, (first, second) in enumerate(transverse_pairs):
-            a = positions[interval][first]
-            b = positions[interval][second]
-            c = positions[interval + 1][second]
-            d = positions[interval + 1][first]
+            a = positions[first_level][first]
+            b = positions[first_level][second]
+            c = positions[second_level][second]
+            d = positions[second_level][first]
             area = (b - a).cross(d - a).length + (c - b).cross(d - b).length
             if area <= _GEOMETRY_EPSILON:
                 raise ValueError("Longitudinal plan would create a degenerate quad")
@@ -4869,6 +5479,7 @@ def build_longitudinal_resample_plan(
 
     return LongitudinalResamplePlan(
         section_type=analysis.section_type,
+        path_type=analysis.path_type,
         path_shape=path_shape,
         current_cuts=analysis.current_cuts,
         target_cuts=target_cuts,
@@ -4885,12 +5496,25 @@ def build_longitudinal_resample_plan(
         interval_sources=tuple(interval_sources),
         source_face_normals=tuple(source_face_normals),
         source_face_materials=tuple(source_face_materials),
-        base_vertices=(analysis.levels[0], analysis.levels[-1]),
+        base_vertices=(
+            ((), ())
+            if closed_path
+            else (analysis.levels[0], analysis.levels[-1])
+        ),
         base_coordinates=(
-            tuple(vertex.co.copy() for vertex in analysis.levels[0]),
-            tuple(vertex.co.copy() for vertex in analysis.levels[-1]),
+            ((), ())
+            if closed_path
+            else (
+                tuple(vertex.co.copy() for vertex in analysis.levels[0]),
+                tuple(vertex.co.copy() for vertex in analysis.levels[-1]),
+            )
         ),
         base_edges=analysis.base_edges,
+        anchor_level=analysis.anchor_level,
+        anchor_coordinates=tuple(
+            vertex.co.copy() for vertex in analysis.anchor_level
+        ),
+        anchor_edges=analysis.anchor_edges,
         external_elements=analysis.external_elements,
     )
 
@@ -4996,6 +5620,7 @@ def _discard_longitudinal_vertices(
 
 def _resolve_longitudinal_selection(
     chains: Sequence[Sequence[Any]],
+    path_type: LongitudinalPathType = LongitudinalPathType.OPEN_PATH,
 ) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
     """Resolve the final rail selection without changing mesh selection state."""
     vertices = tuple(vertex for chain in chains for vertex in chain)
@@ -5004,7 +5629,10 @@ def _resolve_longitudinal_selection(
     edges = tuple(
         _find_connecting_edge(first, second)
         for chain in chains
-        for first, second in zip(chain, chain[1:])
+        for first_index, second_index in _longitudinal_level_pairs(
+            len(chain), path_type
+        )
+        for first, second in ((chain[first_index], chain[second_index]),)
     )
     if any(edge is None or not edge.is_valid for edge in edges):
         raise RuntimeError("A staged longitudinal rail edge is missing")
@@ -5035,17 +5663,25 @@ def _create_longitudinal_geometry(
     before: tuple[int, int, int],
 ) -> LongitudinalStaging:
     """Build and journal a complete replacement while originals remain live."""
-    level_count = plan.target_cuts + 2
+    closed_path = plan.path_type is LongitudinalPathType.CLOSED_PATH
+    level_count = plan.target_cuts if closed_path else plan.target_cuts + 2
     chain_count = len(plan.ordered_chains)
-    new_levels: list[tuple[Any, ...]] = [plan.base_vertices[0]]
+    new_levels: list[tuple[Any, ...]] = [
+        plan.anchor_level if closed_path else plan.base_vertices[0]
+    ]
     created_vertices = []
     created_edges = []
     created_faces = []
     custom_data_copies: list[_LongitudinalCustomDataCopy] = []
     try:
-        for level_index in range(1, level_count - 1):
+        created_level_range = range(
+            1, level_count if closed_path else level_count - 1
+        )
+        for level_index in created_level_range:
             source_index, blend = plan.position_sources[level_index]
-            source_level = source_index + (1 if blend > 0.5 else 0)
+            source_level = (
+                source_index + (1 if blend > 0.5 else 0)
+            ) % len(plan.levels)
             level = []
             for chain_index in range(chain_count):
                 vertex = edit_mesh.verts.new(
@@ -5060,14 +5696,17 @@ def _create_longitudinal_geometry(
                 )
                 level.append(vertex)
             new_levels.append(tuple(level))
-        new_levels.append(plan.base_vertices[1])
+        if not closed_path:
+            new_levels.append(plan.base_vertices[1])
 
         for chain_index in range(chain_count):
-            for level_index in range(level_count - 1):
+            for level_index, (first_level, second_level) in enumerate(
+                _longitudinal_level_pairs(level_count, plan.path_type)
+            ):
                 edge = edit_mesh.edges.new(
                     (
-                        new_levels[level_index][chain_index],
-                        new_levels[level_index + 1][chain_index],
+                        new_levels[first_level][chain_index],
+                        new_levels[second_level][chain_index],
                     )
                 )
                 created_edges.append(edge)
@@ -5076,7 +5715,8 @@ def _create_longitudinal_geometry(
                         plan.interval_sources[level_index]
                     ],
                     plan.ordered_chains[chain_index][
-                        plan.interval_sources[level_index] + 1
+                        (plan.interval_sources[level_index] + 1)
+                        % len(plan.levels)
                     ],
                 )
                 if source_edge is None:
@@ -5091,9 +5731,11 @@ def _create_longitudinal_geometry(
         transverse_pairs = _longitudinal_transverse_pairs(
             chain_count, plan.section_type
         )
-        for level_index in range(1, level_count - 1):
+        for level_index in created_level_range:
             source_index, blend = plan.position_sources[level_index]
-            source_level = source_index + (1 if blend > 0.5 else 0)
+            source_level = (
+                source_index + (1 if blend > 0.5 else 0)
+            ) % len(plan.levels)
             for first, second in transverse_pairs:
                 edge = edit_mesh.edges.new(
                     (new_levels[level_index][first], new_levels[level_index][second])
@@ -5112,15 +5754,17 @@ def _create_longitudinal_geometry(
                     custom_data_copies,
                 )
 
-        for level_index in range(level_count - 1):
+        for level_index, (first_level, second_level) in enumerate(
+            _longitudinal_level_pairs(level_count, plan.path_type)
+        ):
             source_interval = plan.interval_sources[level_index]
             for transverse_index, (first, second) in enumerate(transverse_pairs):
                 face = edit_mesh.faces.new(
                     (
-                        new_levels[level_index][first],
-                        new_levels[level_index][second],
-                        new_levels[level_index + 1][second],
-                        new_levels[level_index + 1][first],
+                        new_levels[first_level][first],
+                        new_levels[first_level][second],
+                        new_levels[second_level][second],
+                        new_levels[second_level][first],
                     )
                 )
                 created_faces.append(face)
@@ -5154,13 +5798,39 @@ def _create_longitudinal_geometry(
             tuple(new_levels[level][chain] for level in range(level_count))
             for chain in range(chain_count)
         )
-        band_faces = _collect_longitudinal_band_faces(chains, plan.section_type)
-        selection_vertices, rail_edges = _resolve_longitudinal_selection(chains)
-        staged_analysis = analyze_longitudinal_bend(rail_edges)
+        band_faces = _collect_longitudinal_band_faces(
+            chains, plan.section_type, plan.path_type
+        )
+        selection_vertices, rail_edges = _resolve_longitudinal_selection(
+            chains, plan.path_type
+        )
+        if closed_path:
+            old_vertices = {
+                vertex for level in plan.levels[1:] for vertex in level
+            }
+            ignored_elements = frozenset(
+                old_vertices
+                | {
+                    edge for vertex in old_vertices for edge in vertex.link_edges
+                }
+                | {
+                    face for row in plan.band_faces for face in row
+                }
+            )
+            staged_analysis = _analyze_longitudinal_common(
+                chains,
+                plan.section_type,
+                LongitudinalSelectionKind.RAILS,
+                plan.path_type,
+                ignored_elements,
+            )
+        else:
+            staged_analysis = analyze_longitudinal_bend(rail_edges)
         if (
             not staged_analysis.valid
             or staged_analysis.current_cuts != plan.target_cuts
             or staged_analysis.section_type is not plan.section_type
+            or staged_analysis.path_type is not plan.path_type
         ):
             raise RuntimeError(
                 "Longitudinal staging failed full reanalysis: "
@@ -5171,6 +5841,7 @@ def _create_longitudinal_geometry(
             staged_analysis.status,
             selection_kind=staged_analysis.selection_kind,
             section_type=staged_analysis.section_type,
+            path_type=staged_analysis.path_type,
             ordered_chains=staged_analysis.ordered_chains,
             levels=staged_analysis.levels,
             band_faces=staged_analysis.band_faces,
@@ -5178,6 +5849,8 @@ def _create_longitudinal_geometry(
             cumulative_lengths=staged_analysis.cumulative_lengths,
             path_length=staged_analysis.path_length,
             base_edges=staged_analysis.base_edges,
+            anchor_level=staged_analysis.anchor_level,
+            anchor_edges=staged_analysis.anchor_edges,
             external_elements=plan.external_elements,
         )
         delta = plan.target_cuts - plan.current_cuts
@@ -5222,9 +5895,26 @@ def validate_longitudinal_result(
         raise RuntimeError("Longitudinal resampling removed a base edge")
     if any(not element.is_valid for element in plan.external_elements):
         raise RuntimeError("Longitudinal resampling damaged exterior geometry")
+    if plan.path_type is LongitudinalPathType.CLOSED_PATH:
+        if tuple(staging.chains[index][0] for index in range(len(staging.chains))) != plan.anchor_level:
+            raise RuntimeError("Closed longitudinal resampling changed anchor correspondence")
+        if any(
+            not vertex.is_valid or vertex.co != coordinate
+            for vertex, coordinate in zip(
+                plan.anchor_level, plan.anchor_coordinates
+            )
+        ):
+            raise RuntimeError("Closed longitudinal resampling changed the anchor level")
+        if any(not edge.is_valid for edge in plan.anchor_edges):
+            raise RuntimeError("Closed longitudinal resampling removed an anchor edge")
 
     levels = build_longitudinal_levels(staging.chains)
-    if len(levels) != plan.target_cuts + 2:
+    expected_level_count = (
+        plan.target_cuts
+        if plan.path_type is LongitudinalPathType.CLOSED_PATH
+        else plan.target_cuts + 2
+    )
+    if len(levels) != expected_level_count:
         raise RuntimeError("Longitudinal resampling produced the wrong level count")
     tolerance = max(_GEOMETRY_EPSILON * 100.0, plan.path_length * 1.0e-7)
     for actual_level, expected_level in zip(levels, plan.positions):
@@ -5248,12 +5938,20 @@ def validate_longitudinal_result(
     transverse_count = len(
         _longitudinal_transverse_pairs(chain_count, plan.section_type)
     )
-    expected_created = (
-        chain_count * plan.target_cuts,
-        chain_count * (plan.target_cuts + 1)
-        + transverse_count * plan.target_cuts,
-        transverse_count * (plan.target_cuts + 1),
-    )
+    if plan.path_type is LongitudinalPathType.CLOSED_PATH:
+        expected_created = (
+            chain_count * (plan.target_cuts - 1),
+            chain_count * plan.target_cuts
+            + transverse_count * (plan.target_cuts - 1),
+            transverse_count * plan.target_cuts,
+        )
+    else:
+        expected_created = (
+            chain_count * plan.target_cuts,
+            chain_count * (plan.target_cuts + 1)
+            + transverse_count * plan.target_cuts,
+            transverse_count * (plan.target_cuts + 1),
+        )
     actual_created = (
         len(staging.created_vertices),
         len(staging.created_edges),
@@ -5303,7 +6001,59 @@ def validate_longitudinal_result(
     if edit_mesh.select_mode != {"EDGE"}:
         raise RuntimeError("Longitudinal staging requires edge selection mode")
 
-    final_analysis = analyze_longitudinal_bend(staging.selection_edges)
+    if plan.path_type is LongitudinalPathType.CLOSED_PATH:
+        # Reproduce the next public Rails ordering, not just its geometry checks.
+        components = separate_connected_edge_components(staging.selection_edges)
+        canonical_section, canonical_chains = (
+            _orient_and_order_closed_longitudinal_rails(components)
+        )
+        if (
+            canonical_section is not plan.section_type
+            or canonical_chains != staging.chains
+        ):
+            raise RuntimeError(
+                "Closed longitudinal resampling would change canonical Rails "
+                "anchor, direction, phase, or chain order"
+            )
+        old_vertices = {
+            vertex for level in plan.levels[1:] for vertex in level
+        }
+        # VERTS deletion frees source slots without reordering live BMesh slots.
+        # Enumerate all survivors, including exterior and staged vertices, in
+        # their real iteration order; never write BMVert.index to simulate it.
+        projected_indices = {
+            vertex: index
+            for index, vertex in enumerate(
+                vertex for vertex in edit_mesh.verts if vertex not in old_vertices
+            )
+        }
+        projected_section, projected_chains = (
+            _orient_and_order_closed_longitudinal_rails(
+                components, projected_indices
+            )
+        )
+        if (
+            projected_section is not plan.section_type
+            or projected_chains != staging.chains
+        ):
+            raise RuntimeError(
+                "Closed longitudinal resampling would change post-delete canonical "
+                "Rails anchor, direction, phase, or chain order"
+            )
+        ignored_elements = frozenset(
+            old_vertices
+            | {edge for vertex in old_vertices for edge in vertex.link_edges}
+            | {face for row in plan.band_faces for face in row}
+        )
+        final_analysis = _analyze_longitudinal_common(
+            staging.chains,
+            plan.section_type,
+            LongitudinalSelectionKind.RAILS,
+            plan.path_type,
+            ignored_elements,
+        )
+    else:
+        final_analysis = analyze_longitudinal_bend(staging.selection_edges)
     if not final_analysis.valid:
         raise RuntimeError(
             f"Longitudinal reanalysis failed: {final_analysis.status}"
@@ -5312,6 +6062,15 @@ def validate_longitudinal_result(
         raise RuntimeError("Longitudinal reanalysis found the wrong Current Cuts")
     if final_analysis.section_type is not plan.section_type:
         raise RuntimeError("Longitudinal resampling changed cross-section topology")
+    if final_analysis.path_type is not plan.path_type:
+        raise RuntimeError("Longitudinal resampling changed path topology")
+    if (
+        plan.path_type is LongitudinalPathType.CLOSED_PATH
+        and final_analysis.anchor_level != plan.anchor_level
+    ):
+        raise RuntimeError(
+            "Closed longitudinal resampling rotated or permuted anchor correspondence"
+        )
     return staging.analysis
 
 
@@ -5336,7 +6095,13 @@ def resample_longitudinal_bend(
         )
 
         old_interior_vertices = tuple(
-            vertex for level in plan.levels[1:-1] for vertex in level
+            vertex
+            for level in (
+                plan.levels[1:]
+                if plan.path_type is LongitudinalPathType.CLOSED_PATH
+                else plan.levels[1:-1]
+            )
+            for vertex in level
         )
         chain_count = len(plan.ordered_chains)
         transverse_count = len(
@@ -5348,12 +6113,20 @@ def resample_longitudinal_bend(
         old_faces = {
             face for vertex in old_interior_vertices for face in vertex.link_faces
         }
-        expected_old = (
-            chain_count * plan.current_cuts,
-            chain_count * (plan.current_cuts + 1)
-            + transverse_count * plan.current_cuts,
-            transverse_count * (plan.current_cuts + 1),
-        )
+        if plan.path_type is LongitudinalPathType.CLOSED_PATH:
+            expected_old = (
+                chain_count * (plan.current_cuts - 1),
+                chain_count * plan.current_cuts
+                + transverse_count * (plan.current_cuts - 1),
+                transverse_count * plan.current_cuts,
+            )
+        else:
+            expected_old = (
+                chain_count * plan.current_cuts,
+                chain_count * (plan.current_cuts + 1)
+                + transverse_count * plan.current_cuts,
+                transverse_count * (plan.current_cuts + 1),
+            )
         if (
             len(set(old_interior_vertices)) != expected_old[0]
             or len(old_edges) != expected_old[1]
@@ -5365,8 +6138,12 @@ def resample_longitudinal_bend(
         result = LongitudinalResampleResult(
             success=True,
             message=(
-                f"Resampled longitudinal cuts: {plan.current_cuts} → "
-                f"{plan.target_cuts} | Bases preserved | "
+                f"Resampled longitudinal "
+                f"{'levels' if plan.path_type is LongitudinalPathType.CLOSED_PATH else 'cuts'}: "
+                f"{plan.current_cuts} → "
+                f"{plan.target_cuts} | "
+                f"{'Anchor preserved' if plan.path_type is LongitudinalPathType.CLOSED_PATH else 'Bases preserved'} | "
+                f"Path: {plan.path_type.value} | "
                 f"Section: {plan.section_type.value} | "
                 f"Path Shape: {plan.path_shape.value.title()}"
             ),

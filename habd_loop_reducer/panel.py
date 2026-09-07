@@ -35,16 +35,35 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
             analysis_box.label(
                 text=f"Input: {settings.longitudinal_selection_kind.title()}"
             )
-            bases = "Detected" if settings.longitudinal_analysis_valid else "Not Detected"
-            analysis_box.label(text=f"Bases: {bases}")
+            analysis_box.label(
+                text=f"Path: {settings.longitudinal_path_type.title()}"
+            )
+            boundary = (
+                "Anchor"
+                if settings.longitudinal_path_type == "CLOSED PATH"
+                else "Bases"
+            )
+            detected = (
+                "Detected"
+                if settings.longitudinal_analysis_valid
+                else "Not Detected"
+            )
+            analysis_box.label(text=f"{boundary}: {detected}")
             analysis_box.label(
                 text=f"Cross-Section: {settings.longitudinal_section_type.title()}"
             )
+            count_label = (
+                "Levels"
+                if settings.longitudinal_path_type == "CLOSED PATH"
+                else "Cuts"
+            )
             analysis_box.label(
-                text=f"Current Cuts: {settings.longitudinal_current_cuts}"
+                text=f"Current {count_label}: {settings.longitudinal_current_cuts}"
             )
             analysis_box.prop(
-                settings, "longitudinal_target_cuts", text="Target Cuts"
+                settings,
+                "longitudinal_target_cuts",
+                text=f"Target {count_label}",
             )
             change = (
                 settings.longitudinal_target_cuts
@@ -61,7 +80,12 @@ class HABD_PT_loop_reducer(bpy.types.Panel):
 
             ready = (
                 settings.longitudinal_analysis_valid
-                and settings.longitudinal_target_cuts >= 1
+                and settings.longitudinal_target_cuts
+                >= (
+                    3
+                    if settings.longitudinal_path_type == "CLOSED PATH"
+                    else 1
+                )
                 and settings.longitudinal_target_cuts
                 != settings.longitudinal_current_cuts
             )

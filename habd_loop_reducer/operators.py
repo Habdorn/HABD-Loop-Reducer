@@ -77,6 +77,11 @@ def _store_longitudinal_analysis(settings, analysis) -> None:
         if analysis.selection_kind is not None
         else "UNKNOWN"
     )
+    settings.longitudinal_path_type = (
+        analysis.path_type.value.replace("_", " ")
+        if analysis.path_type is not None
+        else "UNKNOWN"
+    )
     settings.longitudinal_current_cuts = analysis.current_cuts
     settings.longitudinal_level_count = len(analysis.levels)
     settings.longitudinal_path_length = analysis.path_length
@@ -240,7 +245,10 @@ class HABD_OT_analyze_longitudinal(bpy.types.Operator):
             return {"CANCELLED"}
         summary = (
             f"Input: {settings.longitudinal_selection_kind.title()} | "
-            f"Bases detected | Cuts: {analysis.current_cuts} | "
+            f"Path: {settings.longitudinal_path_type.title()} | "
+            f"{'Anchor' if analysis.path_type.value == 'CLOSED_PATH' else 'Bases'} detected | "
+            f"{'Levels' if analysis.path_type.value == 'CLOSED_PATH' else 'Cuts'}: "
+            f"{analysis.current_cuts} | "
             f"Section: {analysis.section_type.value} | "
             f"Path: {analysis.path_length:.4f}"
         )
@@ -391,8 +399,16 @@ class HABD_OT_reduce_loops(bpy.types.Operator):
             return {"CANCELLED"}
 
         target_cuts = settings.longitudinal_target_cuts
-        if target_cuts < 1:
-            self.report({"ERROR"}, "Target Cuts must be at least 1")
+        minimum_target = (
+            3 if analysis.path_type.value == "CLOSED_PATH" else 1
+        )
+        if target_cuts < minimum_target:
+            message = (
+                "A closed longitudinal path requires at least 3 levels"
+                if minimum_target == 3
+                else "Target Cuts must be at least 1"
+            )
+            self.report({"ERROR"}, message)
             return {"CANCELLED"}
         if target_cuts == analysis.current_cuts:
             settings.longitudinal_status = (
