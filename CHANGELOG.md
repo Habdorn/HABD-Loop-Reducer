@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.0] - 2026-09-06
+
+### Added
+
+- Longitudinal Increase and Reduce for regular quad bands using Rails or Cross Loops input.
+- Separate OPEN_PATH / CLOSED_PATH detection and OPEN / CLOSED transverse-section topology.
+- Preserve and Smooth path shaping, including periodic centripetal Catmull–Rom sampling for closed paths.
+- Physical base preservation for open paths and physical anchor preservation for closed paths.
+- Periodic arc-length and full last → anchor handling in geometry, winding, materials, UVs, and compatible custom data.
+- Independent closing-twist and oriented quaternion seam validation for Smooth CLOSED_PATH, with a 5° discrepancy tolerance and conservative near-180° rejection.
+
+### Improved
+
+- Transactional longitudinal staging and validation before a single final source deletion, with rollback of staged geometry, selection, selection history, selection mode, and normals on pre-commit failure.
+- Stable anchor, direction, phase, and transverse ordering across accepted consecutive closed-path resamplings, guarded using current and projected post-delete vertex indices.
+- Conservative rejection of ambiguous Rails / Cross Loops interpretations, dual-axis tori, chords, external attachments, Möbius topology, and non-trivial monodromy or permutations.
+
+### Fixed
+
+- Straight Increase false spacing-validation failures by checking generated coordinates against frozen planner targets before destructive mutation.
+
+### Known limitations
+
+- Closed-path resampling may reject otherwise regular geometry when seam continuity or canonical stability cannot be preserved conservatively.
+- No automatic twist distribution, new parallel transport, or seam correction is introduced.
+- UV/custom-data transfer retains the existing copy-based contract; exact UV redistribution is not guaranteed.
+- A partial failure inside Blender's final native deletion cannot restore original BMesh element identity; all Python-side longitudinal validation precedes that boundary.
+
 ## [0.3.0] - 2026-08-08
 
 ### Added

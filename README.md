@@ -1,10 +1,10 @@
 # HABD Loop Reducer
 
-HABD Loop Reducer is a free and open-source Blender add-on for controlled segment resampling on straight and curved tubes and profile-based surfaces.
+HABD Loop Reducer is a free and open-source Blender add-on for controlled segment resampling on straight and curved tubes, profile-based surfaces, and open or closed longitudinal paths.
 
 ## Status
 
-Active Development — Version 0.3.0
+Stable Release — Version 0.4.0
 
 ## Compatibility
 
@@ -35,10 +35,20 @@ Blender 5.2 LTS or later.
 - Preservation of compatible flat areas and bevel boundary rails.
 - Shape key safety validation.
 - Pre-mutation planning and rejection of incompatible topology.
+- Longitudinal Increase and Reduce with automatic Rails / Cross Loops input detection.
+- OPEN_PATH and periodic CLOSED_PATH resampling with Preserve or Smooth shaping.
+- Open and closed transverse sections, independently of longitudinal path topology, when the selected band is unambiguous.
+- Preserved end bases for open paths and a physically preserved anchor level for closed paths.
+- Periodic arc-length and complete closing-interval geometry and custom-data transfer.
+- Independent geometric seam and twist validation for Smooth closed paths.
+- Transactional longitudinal staging, validation, and rollback before the final source deletion.
+- Straight Increase validation against frozen planned positions to avoid false spacing errors.
 
 ## Target Behavior
 
 **Target** is the final number of radial segments or profile samples. HABD Loop Reducer can reduce when Target is lower than Current, increase when it is higher, and leave the mesh unchanged when both values match.
+
+For Longitudinal resampling, **Target Cuts** counts interior levels between the two preserved bases of an OPEN_PATH. **Target Levels** counts all levels around a CLOSED_PATH, including the preserved anchor, with a minimum of three. These counts are independent of transverse section samples.
 
 ## Geometry Modes
 
@@ -62,9 +72,22 @@ Profile supports:
 
 For integrated bevels, the operation plans every detected region before mutation and preserves compatible flats, boundaries, exterior geometry, materials, and custom data. Ambiguous attachments and unsupported solid boundaries are rejected rather than treated as universally safe.
 
+## Longitudinal Resampling
+
+Choose **Direction: Longitudinal** to change the number of cross-sections along a regular quad band. Select complete **Rails** or consecutive complete **Cross Loops**, then run **Analyze Bend**. Closed-path Cross Loops must cover the full periodic cycle. The analyzer detects OPEN_PATH / CLOSED_PATH separately from the transverse section's OPEN / CLOSED topology.
+
+- **Preserve** samples the existing path by accumulated length and interpolates its sections.
+- **Smooth** uses the existing centripetal Catmull–Rom helper to shape and arc-length sample the centerline. Closed paths use periodic control points and sampling.
+- OPEN_PATH retains both physical bases. CLOSED_PATH retains one physical anchor level without duplicating it at the seam.
+- The closing interval **last → anchor** participates in arc-length, geometry, winding, materials, UVs, and compatible custom-data transfer.
+- Closed-path guards reject results that would change the canonical anchor, direction, phase, or transverse ordering on the next analysis, including after post-delete vertex reindexing.
+- Longitudinal replacements are staged and validated while the source remains intact; failures before the final destructive boundary discard staged geometry and restore selection state and normals.
+
+Closed paths are intentionally conservative: ambiguous OPEN/OPEN or OPEN/CLOSED interpretations, dual-axis tori, chords, external attachments, Möbius topology, and non-trivial monodromy or transverse permutations are rejected. Smooth additionally checks closing twist and the oriented 3D seam-turn discrepancy against a 5° tolerance, rejecting ambiguous near-180° turns. There is no automatic twist distribution, new parallel transport, or seam correction; some otherwise regular bands may be rejected to preserve the anchor and canonical ordering.
+
 ## Installation
 
-1. Download `habd_loop_reducer-0.3.0.zip`.
+1. Download `habd_loop_reducer-0.4.0.zip` from [GitHub Releases](https://github.com/Habdorn/HABD-Loop-Reducer/releases/tag/v0.4.0).
 2. Open Blender Preferences.
 3. Go to **Add-ons**.
 4. Choose **Install from Disk**.
@@ -79,7 +102,7 @@ For integrated bevels, the operation plans every detected region before mutation
 3. Select all complete longitudinal edge chains.
 4. Open the 3D Viewport Sidebar with `N`.
 5. Open the **HABD** tab.
-6. Choose **Geometry Mode**:
+6. With **Direction: Radial**, choose **Geometry Mode**:
    - **Straight**
    - **Curved**
    - **Profile**
@@ -87,6 +110,8 @@ For integrated bevels, the operation plans every detected region before mutation
 8. Set the final **Target Segments** or **Target Samples**.
 9. Run **Apply Segments**.
 10. Inspect the result and use Undo if necessary.
+
+For Longitudinal operation, select the compatible Rails or Cross Loops in Edit Mode, choose **Direction: Longitudinal** and **Path Shape: Preserve / Smooth**, run **Analyze Bend**, set **Target Cuts / Target Levels**, and run **Apply Cuts**.
 
 Always test destructive topology operations on a copy of important production meshes.
 
@@ -103,8 +128,11 @@ Example resampling operations include:
 - Variable-radius curved tube: 32 → 26
 - Straight or curved tube increase: 16 → 24
 - Open, closed, or bevel-region profile resampling to a final target sample count
+- Longitudinal closed-path levels: 16 → 24 or 24 → 12, subject to seam and canonical-stability validation
 
 ## Supported Topology
+
+The following describes Radial / Profile input. Longitudinal input and its additional restrictions are described above.
 
 - Complete longitudinal edge chains.
 - Equivalent chain topology.

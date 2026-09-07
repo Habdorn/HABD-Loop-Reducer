@@ -1,7 +1,7 @@
 schema_version = "1.0.0"
 
 id = "habd_loop_reducer"
-version = "0.3.0"
+version = "0.4.0"
 name = "HABD Loop Reducer"
 tagline = "Resample segments on tubes and profiles"
 maintainer = "Habdorn"
